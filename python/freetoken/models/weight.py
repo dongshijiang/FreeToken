@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterator, Tuple
 
 import torch
+from freetoken.distributed import get_tp_info
 from freetoken.utils import cached_load_hf_config
 
 from .register import _load_attr, get_model_spec
@@ -224,6 +225,11 @@ def load_weight(
     # a text-only engine never built the tower, so its tensors are not even read
     keep = None if include_vision else (lambda name: not name.startswith(VISION_KEY_PREFIXES))
     if is_ftw_checkpoint(model_path):
+        if get_tp_info().size > 1:
+            raise ValueError(
+                "FTW checkpoints are not TP-sharded (they store post-conversion full-size "
+                "tensors); serve the raw safetensors checkpoint with --tp-size > 1"
+            )
         weights = iter_ftw_weights(model_path, keep=keep)
     else:
         _config, spec = _spec_for_model_path(model_path)

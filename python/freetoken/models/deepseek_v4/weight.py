@@ -20,6 +20,7 @@ from tqdm import tqdm
 from freetoken.layers.quantization import QuantKind
 from freetoken.distributed import get_tp_info
 from freetoken.models.loader import drop_page_cache
+from freetoken.utils import div_ceil
 
 from .args import DeepseekV4Args, load_args
 
@@ -72,6 +73,31 @@ def _dequant_fp8_block(weight: torch.Tensor, scale: torch.Tensor, block: int = 1
     return (weight.to(torch.float32) * s).to(torch.bfloat16)
 
 
+def shard_rows(value: torch.Tensor, *, rank: int, size: int, rows: int) -> torch.Tensor:
+    """This rank's first-dim shard of ``rows`` (the caller validates divisibility)."""
+    if size <= 1:
+        return value
+    start = rank * rows
+    return value[start:start + rows].clone()
+
+
+def shard_cols(value: torch.Tensor, *, rank: int, size: int, cols: int) -> torch.Tensor:
+    """This rank's last-dim shard of ``cols`` (the caller validates divisibility)."""
+    if size <= 1:
+        return value
+    start = rank * cols
+    return value[:, start:start + cols].clone()
+
+
+def vocab_rows(value: torch.Tensor, *, rank: int, size: int, vocab_size: int) -> torch.Tensor:
+    """The rank's ceil-partitioned vocab rows (matches ``VocabParallelEmbedding``)."""
+    if size <= 1:
+        return value
+    n = div_ceil(vocab_size, size)
+    start = rank * n
+    return value[start:start + n].clone()
+
+
 def iter_weights(
     model_path: str,
     device,
@@ -96,19 +122,57 @@ def iter_weights(
     args = load_args(model_path, max_batch_size=1)
     reader = _ShardReader(model_path, _weight_map(model_path), device)
 
+    tp = get_tp_info()
+    rank, size = tp.rank, tp.size
+    if size > 1:
+        # TP shards attention heads (wq_b / attn_sink), output groups (wo_a / wo_b) and the
+        # shared-expert intermediate; the latent projections (wq_a, wkv), compressor /
+        # indexer and HC functions stay replicated.
+        for name, total in (
+            ("n_heads", args.n_heads),
+            ("o_groups", args.o_groups),
+            ("moe_inter_dim", args.moe_inter_dim),
+        ):
+            if total % size:
+                raise ValueError(f"DeepSeek-V4 TP size {size} does not divide {name}={total}")
+
     def get(name: str) -> torch.Tensor:
         return reader.get(name)
 
-    def linear(src: str, dst: str):
-        yield f"{dst}.weight", get(f"{src}.weight")
-        # fp8 linears declare the e8m0 block scale under the quant method's role name
+    def linear(src: str, dst: str, *, rows: int | None = None, cols: int | None = None):
+        """A block fp8 linear, sharded on the output (rows) or input (cols) axis; the
+        e8m0 block scale follows the same axis in 128-row blocks."""
+        w = get(f"{src}.weight")
+        if rows is not None:
+            w = shard_rows(w, rank=rank, size=size, rows=rows)
+        elif cols is not None:
+            w = shard_cols(w, rank=rank, size=size, cols=cols)
+        yield f"{dst}.weight", w
         if reader.has(f"{src}.scale"):
-            yield f"{dst}.weight_scale_inv", get(f"{src}.scale")
+            sc = get(f"{src}.scale")
+            if rows is not None:
+                sc = shard_rows(sc, rank=rank, size=size, rows=rows // 128)
+            elif cols is not None:
+                sc = shard_cols(sc, rank=rank, size=size, cols=cols // 128)
+            yield f"{dst}.weight_scale_inv", sc
+
+    heads = args.n_heads // size
+    groups = args.o_groups // size
+    inter = args.moe_inter_dim // size
+    if size > 1:
+        # e8m0 block scales are indexed in 128-row/coli blocks; the shards must align.
+        for label, span in (
+            ("heads x head_dim", heads * args.head_dim),
+            ("groups x o_lora_rank", groups * args.o_lora_rank),
+            ("moe_inter_dim", inter),
+        ):
+            if span % 128:
+                raise ValueError(f"DeepSeek-V4 TP {label} shard {span} is not a multiple of 128")
 
     try:
-        yield "model.embed.weight", get("embed.weight")
+        yield "model.embed.weight", vocab_rows(get("embed.weight"), rank=rank, size=size, vocab_size=args.vocab_size)
         yield "model.norm.weight", get("norm.weight")
-        yield "model.head.weight", get("head.weight")
+        yield "model.head.weight", vocab_rows(get("head.weight"), rank=rank, size=size, vocab_size=args.vocab_size)
         for nm in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
             yield f"model.{nm}", get(nm)
 
@@ -117,15 +181,18 @@ def iter_weights(
             m = f"model.{a}"
             yield from linear(f"{a}.wq_a", f"{m}.wq_a")
             yield f"{m}.q_norm.weight", get(f"{a}.q_norm.weight")
-            yield from linear(f"{a}.wq_b", f"{m}.wq_b")
+            yield from linear(f"{a}.wq_b", f"{m}.wq_b", rows=heads * args.head_dim)
             yield from linear(f"{a}.wkv", f"{m}.wkv")
             yield f"{m}.kv_norm.weight", get(f"{a}.kv_norm.weight")
             # wo_a: FP8 in the checkpoint, dequantized to bf16 (reference bf16 einsum).
-            yield f"{m}.wo_a", _dequant_fp8_block(
-                get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale")
+            yield f"{m}.wo_a", shard_rows(
+                _dequant_fp8_block(get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale")),
+                rank=rank, size=size, rows=groups * args.o_lora_rank,
             )
-            yield from linear(f"{a}.wo_b", f"{m}.wo_b")
-            yield f"{m}.attn_sink", get(f"{a}.attn_sink")
+            yield from linear(f"{a}.wo_b", f"{m}.wo_b", cols=groups * args.o_lora_rank)
+            yield f"{m}.attn_sink", shard_rows(
+                get(f"{a}.attn_sink"), rank=rank, size=size, rows=heads
+            )
 
             ratio = args.compress_ratios[L]
             if ratio:
@@ -151,7 +218,10 @@ def iter_weights(
                 yield f"model.{g}.bias", get(f"{g}.bias")
             for proj in ("w1", "w2", "w3"):
                 src = f"layers.{L}.ffn.shared_experts.{proj}"
-                yield from linear(src, f"model.{src}")
+                if proj == "w2":
+                    yield from linear(src, f"model.{src}", cols=inter)
+                else:
+                    yield from linear(src, f"model.{src}", rows=inter)
 
             for nm in (
                 "hc_attn_fn", "hc_ffn_fn", "hc_attn_base",
@@ -178,8 +248,6 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
     ``_scale`` companions (``w1`` / ``w3`` / ``w2``). The MTP layer's experts are skipped."""
     if kind is not QuantKind.MXFP4:
         return None
-    if get_tp_info().size > 1:
-        raise NotImplementedError("DeepSeek-V4 expert banks support TP=1 only")
     from freetoken.models.weight import iter_expert_tensors_parallel
     from freetoken.moe.expert_pieces import per_expert_pieces
 

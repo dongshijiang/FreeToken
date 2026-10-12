@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
-from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, get_tp_info, set_tp_info
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
@@ -1751,6 +1751,14 @@ def _adjust_config(config: EngineConfig):
     if is_moe and config.moe_cpu_layers and config.moe_cpu_layers.strip() != "auto":
         if not _parse_cpu_layers_spec(config.moe_cpu_layers, model_config.num_moe_layers):
             override("moe_cpu_layers", None)
+
+    if is_moe and get_tp_info().size > 1 and _decode_target(config) != "gpu":
+        # The CPU MoE executor has no TP collective for its CPU tensors, so a TP boot must
+        # decode routed experts on the GPU slot cache (per-rank banks + _maybe_all_reduce).
+        raise ValueError(
+            "TP > 1 does not support CPU/hybrid MoE decode; run without "
+            "--moe-strategy cpu/hybrid and --moe-cpu-layers"
+        )
 
     if is_moe:
         object.__setattr__(model_config, "moe_strategy", config.moe_strategy)

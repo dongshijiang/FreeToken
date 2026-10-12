@@ -22,10 +22,26 @@ class TritonMxfp4MoEKernel(MoEKernel):
             return "standard MXFP4 kernel reads the concatenated gate|up row order"
         if (cfg.alpha, cfg.beta) != (1.0, 0.0):
             return "standard MXFP4 kernel has no alpha / beta in its swiglu"
-        return self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        if reason := self._tp_geometry_reason(cfg):
+            return reason
+        return self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=True, plain_silu_only=False)
+
+    @staticmethod
+    def _tp_geometry_reason(cfg: MoEConfig) -> str | None:
+        """TP shards the intermediate axis only, so the local shard must keep the
+        e2m1 byte pairs, the 32-wide e8m0 scale groups and the decode kernel's
+        ``(K // 2) % 128`` assertion (K = local intermediate) intact."""
+        if cfg.tp_size <= 1:
+            return None
+        if cfg.intermediate % cfg.tp_size:
+            return f"intermediate {cfg.intermediate} is not divisible by TP size {cfg.tp_size}"
+        if cfg.local_intermediate % 256:
+            return (f"local intermediate {cfg.local_intermediate} is not a multiple of 256 "
+                    "(mxfp4 byte/scale groups and the decode kernel's 128-bytes-per-block)")
+        return None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h = cfg.intermediate, cfg.hidden
+        i, h = cfg.local_intermediate, cfg.hidden
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), E8M0),
@@ -34,6 +50,27 @@ class TritonMxfp4MoEKernel(MoEKernel):
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
+        if cfg.tp_size > 1:
+            # TP shards the fused gate|up bank on the intermediate axis: each rank keeps
+            # the gate and up rows of its own shard together (the kernel reads [gate; up]
+            # per expert), and takes the corresponding down byte / scale columns.
+            r, s = cfg.tp_rank, cfg.tp_size
+            i, i0 = cfg.intermediate, cfg.local_intermediate
+
+            def _gu(t):
+                return torch.cat(
+                    [t[:, r * i0:(r + 1) * i0], t[:, i + r * i0:i + (r + 1) * i0]], dim=1
+                )
+
+            out["gate_up"].copy_(_gu(fused_piece(pieces, "gate_up")).view(torch.uint8))
+            out["gate_up_scale"].copy_(_gu(fused_piece(pieces, "gate_up_scale")).view(E8M0))
+            out["down"].copy_(
+                pieces["down"][..., r * i0 // 2:(r + 1) * i0 // 2].contiguous().view(torch.uint8)
+            )
+            out["down_scale"].copy_(
+                pieces["down_scale"][..., r * i0 // GROUP:(r + 1) * i0 // GROUP].contiguous().view(E8M0)
+            )
+            return {}
         out["gate_up"].copy_(fused_piece(pieces, "gate_up").view(torch.uint8))
         out["gate_up_scale"].copy_(fused_piece(pieces, "gate_up_scale").view(E8M0))
         out["down"].copy_(pieces["down"].view(torch.uint8))
