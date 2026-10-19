@@ -322,6 +322,18 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--cuda-graph-bs",
+        type=int,
+        nargs="+",
+        dest="cuda_graph_bs",
+        default=ServerArgs.cuda_graph_bs,
+        help=(
+            "Decode CUDA graph capture batch sizes; replaces the whole list. "
+            "Default auto-generates [1, 2, 4] + multiples of 8 up to max_running_req."
+        ),
+    )
+
     assert ServerArgs.use_dummy_weight == False
     parser.add_argument(
         "--dummy-weight",
