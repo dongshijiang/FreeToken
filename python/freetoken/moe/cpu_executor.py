@@ -116,16 +116,65 @@ def physical_core_cpus() -> list[int]:
     return reps or allowed or [0]
 
 
-def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
-    """Return (num_threads, core_ids) for the worker pool.
+def rank_shared_physical_cores(share_ordinal: int = 0, share_size: int = 1) -> list[int]:
+    """Physical cores this process's worker pool may use.
 
-    ``requested == 0`` -> one thread per physical core, pinned to it (best for the
-    bandwidth-bound GEMV: SMT siblings only contend for a core's load ports and the
-    spin-barrier degrades badly when oversubscribed). An explicit count is honored,
-    spreading first across physical cores, then across the remaining logical CPUs
-    (so distinct hardware threads are used before any core is doubled up).
+    ``share_size == 1``: the process affinity's physical cores, unchanged (TP=1, or a
+    NUMA mask no other rank shares). ``share_size > 1``: those cores split into
+    ``share_size`` contiguous shares and this process takes share ``share_ordinal``,
+    so ranks that still share an affinity mask do not oversubscribe each other's
+    pinned cores. Falls back to the unsplit set when the machine is too small to
+    give every rank a core.
     """
     reps = physical_core_cpus()
+    if share_size > 1 and len(reps) >= share_size:
+        base, extra = divmod(len(reps), share_size)
+        start = share_ordinal * base + min(share_ordinal, extra)
+        return reps[start : start + base + (1 if share_ordinal < extra else 0)]
+    return reps
+
+
+def core_share_over_group(group, rank: int, size: int) -> tuple[int, int]:
+    """(ordinal, pool_size) of this rank among the TP ranks sharing this process's
+    CPU affinity set, via an all_gather_object over the TP CPU group.
+
+    After NUMA pinning, ranks on different sockets already hold disjoint affinity
+    masks and each is a pool of one; ranks sharing a mask (several ranks per socket,
+    or pinning unavailable) must split the mask's physical cores between them. Any
+    collective failure degrades to one full-set pool per rank: ranks then compete
+    for cores, but output correctness is untouched.
+    """
+    if size <= 1:
+        return 0, 1
+    try:
+        import torch.distributed  # noqa: F401 -- attribute access below needs the submodule
+
+        key = tuple(sorted(os.sched_getaffinity(0)))
+        gathered: list = [None] * size
+        torch.distributed.all_gather_object(gathered, key, group=group)
+    except Exception as exc:
+        logger.warning(
+            f"CPU core partition across TP ranks unavailable ({type(exc).__name__}: {exc}); "
+            "every rank assumes the full core set"
+        )
+        return 0, 1
+    mates = sorted(r for r, k in enumerate(gathered) if k == key)
+    return mates.index(rank), len(mates)
+
+
+def resolve_threads_and_affinity(
+    requested: int, cores: "list[int] | None" = None
+) -> tuple[int, list[int]]:
+    """Return (num_threads, core_ids) for the worker pool.
+
+    ``requested == 0`` -> one thread per physical core of ``cores`` (default: this
+    process's affinity), pinned to it (best for the bandwidth-bound GEMV: SMT
+    siblings only contend for a core's load ports and the spin-barrier degrades
+    badly when oversubscribed). An explicit count is honored, spreading first
+    across those physical cores, then across the remaining logical CPUs (so
+    distinct hardware threads are used before any core is doubled up).
+    """
+    reps = physical_core_cpus() if cores is None else list(cores)
     if requested and requested > 0:
         n = int(requested)
         try:
@@ -158,6 +207,8 @@ class CpuMoeExecutor:
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
         fmt: str | None = None,
+        core_share_ordinal: int = 0,
+        core_share_size: int = 1,
     ) -> None:
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
@@ -218,7 +269,13 @@ class CpuMoeExecutor:
                 )
                 self._flag_sync = False
 
-        nthreads, core_ids = resolve_threads_and_affinity(num_threads)
+        share = rank_shared_physical_cores(core_share_ordinal, core_share_size)
+        if core_share_size > 1:
+            logger.info(
+                f"cpu-moe core share {core_share_ordinal + 1}/{core_share_size}: worker "
+                f"pool restricted to cores {share} of the shared affinity set"
+            )
+        nthreads, core_ids = resolve_threads_and_affinity(num_threads, cores=share)
         coord_core = -1
         if self._flag_sync and num_threads == 0 and nthreads > 2:
             # Auto sizing: give the coordinator the last physical core instead of
@@ -247,7 +304,7 @@ class CpuMoeExecutor:
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
 
-        spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
+        spare = len(share) - nthreads - (1 if coord_core >= 0 else 0) - 1
         clamp = max(1, min(torch.get_num_threads(), spare))
         if clamp < torch.get_num_threads():
             logger.info_rank0(

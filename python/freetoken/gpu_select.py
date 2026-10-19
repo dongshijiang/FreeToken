@@ -285,3 +285,120 @@ def gpu_identity(index: int) -> dict:
         "uuid": format_gpu_uuid(getattr(props, "uuid", None)),
         "total_bytes": int(props.total_memory),
     }
+
+
+def _gpu_numa_node(visible: int) -> "int | None":
+    """The sysfs NUMA node of visible CUDA device ``visible``, or None when it cannot be determined (no NVML, no torch uuid, unknown to sysfs)."""
+    if os.name == "nt":
+        return None
+    import ctypes
+
+    import torch
+
+    uuid = format_gpu_uuid(getattr(torch.cuda.get_device_properties(visible), "uuid", None))
+    if uuid is None:
+        return None
+    try:
+        lib = ctypes.CDLL("libnvidia-ml.so.1")
+    except OSError:
+        return None
+    if lib.nvmlInit() != 0:
+        return None
+    try:
+        count = ctypes.c_int()
+        if lib.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0:
+            return None
+        # NVML indexes physical order; find this process's device by UUID (same match bind_assigned_gpu does)
+        handle = ctypes.c_void_p()
+        for i in range(count.value):
+            candidate = ctypes.c_void_p()
+            if lib.nvmlDeviceGetHandleByIndex_v2(i, ctypes.byref(candidate)) != 0:
+                return None
+            buf = ctypes.create_string_buffer(96)
+            if lib.nvmlDeviceGetUUID(candidate, buf, 96) != 0:
+                return None
+            # nvmlDeviceGetUUID already carries the "GPU-" prefix; do not re-format
+            if buf.value.decode("ascii", "replace").strip().upper() == uuid.upper():
+                handle = candidate
+                break
+        if not handle:
+            return None
+        # nvmlPciInfo layout varies; only the leading 16-byte busId string is stable across versions
+        class _PciInfo(ctypes.Structure):
+            _fields_ = [("busId", ctypes.c_char * 16), ("rest", ctypes.c_byte * 32)]
+
+        info = _PciInfo()
+        if lib.nvmlDeviceGetPciInfo_v2(handle, ctypes.byref(info)) != 0:
+            return None
+        bus_id = info.busId.decode("ascii", "replace").strip()  # e.g. 00000000:1B:00.0
+        if ":" not in bus_id:
+            return None
+        domain, rest = bus_id.split(":", 1)
+        sysfs_addr = f"{int(domain, 16):04x}:{rest.lower()}"
+        try:
+            with open(f"/sys/bus/pci/devices/{sysfs_addr}/numa_node") as f:
+                node = int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+        return node if node >= 0 else None
+    finally:
+        lib.nvmlShutdown()
+
+
+def _numa_node_cpus(node: int) -> "list[int] | None":
+    """The CPUs of sysfs node ``node`` (cpulist like 0-31,64-95), or None."""
+    try:
+        with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
+            spec = f.read().strip()
+    except OSError:
+        return None
+    cpus: list[int] = []
+    for part in spec.split(","):
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            cpus.extend(range(int(lo), int(hi) + 1))
+        elif part:
+            cpus.append(int(part))
+    return cpus or None
+
+
+def _set_mempolicy_preferred(node: int) -> None:
+    """MPOL_PREFERRED via libnuma when present; best-effort, silent on failure."""
+    import ctypes
+
+    try:
+        lib = ctypes.CDLL("libnuma.so.1")
+        lib.numa_set_preferred(ctypes.c_int(node))
+    except (OSError, AttributeError):
+        pass
+
+
+def bind_numa_locality(gpu_visible: int) -> "int | None":
+    """Pin this process's CPU affinity + memory policy to the GPU's NUMA node.
+
+    Decode-time CPU compute (MoE expert banks) is memory-bandwidth-bound: threads
+    and the pages they touch belong on the GPU's socket, so PCIe fetches and host
+    bank reads stay on the local interconnect. Must run before worker pools start
+    and weights load, so first-touch allocations land local. No-op (None) on
+    Windows, without NVML/sysfs topology, on single-node machines, or when the
+    local node shares no CPU with the process affinity.
+    """
+    node = _gpu_numa_node(gpu_visible)
+    if node is None:
+        return None
+    cpus = _numa_node_cpus(node)
+    if not cpus:
+        return None
+    try:
+        allowed = os.sched_getaffinity(0)
+    except AttributeError:
+        return None
+    local = sorted(set(allowed) & set(cpus))
+    if not local or set(local) == set(allowed):
+        return None  # nothing local, or the process is already node-local
+    try:
+        os.sched_setaffinity(0, local)
+    except OSError:
+        return None
+    _set_mempolicy_preferred(node)
+    return node

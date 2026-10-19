@@ -331,10 +331,19 @@ class Engine:
         set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))
         _ensure_expandable_segments()  # before the first CUDA allocation below
 
-        from freetoken.gpu_select import bind_assigned_gpu
+        from freetoken.gpu_select import bind_assigned_gpu, bind_numa_locality
 
         self.device = bind_assigned_gpu(config.tp_info.rank)
         _adjust_config(config)
+        if _decode_target(config) in ("cpu", "hybrid"):
+            # after the auto strategy resolution, before weight load / worker pools:
+            # first-touch page placement follows this
+            numa_node = bind_numa_locality(self.device.index)
+            if numa_node is not None:
+                logger.info(
+                    f"cpu-moe: process affinity + mempolicy bound to NUMA node {numa_node} "
+                    f"(local to GPU {self.device.index})"
+                )
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -749,9 +758,13 @@ class Engine:
         step's misses -- both sides then finish together instead of one idling. The
         achieved bandwidths come from the cached `ft bench bw` profile (the same one the
         auto backend pick reads); without a usable profile the old fixed cap of 1 applies.
+        The profile is benched with one full-node CPU executor; under TP > 1 every rank
+        owns a fraction of the cores, so the benched ratio shifts -- an explicit
+        --moe-hybrid-max-fetch is the tuned option.
         """
         if config.moe_hybrid_max_fetch >= 0:
             return  # explicit fixed cap
+        tp_size = get_tp_info().size
         from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
 
         gpu_name, gpu_uuid = _profile_gpu(self.device.index)
@@ -760,9 +773,15 @@ class Engine:
         )
         if fraction is None:
             cache.hybrid_max_fetch = 1
+            hint = (
+                "; under TP the per-rank CPU bandwidth differs from any benched profile, "
+                "an explicit --moe-hybrid-max-fetch is the tuned option"
+                if tp_size > 1
+                else ""
+            )
             logger.warning_rank0(
                 "--moe-hybrid-max-fetch auto: no usable `ft bench bw` profile for "
-                f"{cache.quant_format!r} experts; using a fixed fetch cap of 1"
+                f"{cache.quant_format!r} experts; using a fixed fetch cap of 1{hint}"
             )
             return
         cache.hybrid_max_fetch = cache.num_experts  # inert: the fraction is the cap
@@ -771,6 +790,12 @@ class Engine:
             f"--moe-hybrid-max-fetch auto: fetching {fraction:.1%} of each decode step's "
             "expert misses over PCIe (benched PCIe/CPU bandwidth ratio), the rest on the CPU"
         )
+        if tp_size > 1:
+            logger.warning_rank0(
+                f"--moe-hybrid-max-fetch auto under TP {tp_size}: the benched profile assumes "
+                "one full-node CPU executor per rank, but each rank owns a fraction of the "
+                "cores; pass an explicit --moe-hybrid-max-fetch for a tuned split"
+            )
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
         """Build the persistent CPU MoE executor (decode-time expert compute).
@@ -780,7 +805,7 @@ class Engine:
         must be stable for the captured nodes. Buffers/tasks themselves are
         allocated lazily on the first (eager) forward at each batch size.
         """
-        from freetoken.moe.cpu_executor import CpuMoeExecutor
+        from freetoken.moe.cpu_executor import CpuMoeExecutor, core_share_over_group
 
         sample = layers[0]
         required = ("top_k", "activation", "apply_router_weight_on_input")
@@ -792,6 +817,9 @@ class Engine:
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        share_ordinal, share_size = core_share_over_group(
+            self.tp_cpu_group, config.tp_info.rank, config.tp_info.size
+        )
         executor = CpuMoeExecutor(
             cache,
             top_k=sample.top_k,
@@ -802,6 +830,8 @@ class Engine:
             device=self.device,
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
+            core_share_ordinal=share_ordinal,
+            core_share_size=share_size,
             # FIXME: the None branch serves GGUF q4_0 banks, which have no quant method yet; drop it once GGUF joins the quant path
             fmt=sample.quant_method.cpu_format if sample.quant_method is not None else None,
         )
@@ -1752,12 +1782,17 @@ def _adjust_config(config: EngineConfig):
         if not _parse_cpu_layers_spec(config.moe_cpu_layers, model_config.num_moe_layers):
             override("moe_cpu_layers", None)
 
-    if is_moe and get_tp_info().size > 1 and _decode_target(config) != "gpu":
+    if is_moe and get_tp_info().size > 1 and _decode_target(config) == "cpu":
         # The CPU MoE executor has no TP collective for its CPU tensors, so a TP boot must
-        # decode routed experts on the GPU slot cache (per-rank banks + _maybe_all_reduce).
+        # not decode routed experts on the CPU executor. Hybrid stays allowed: expert
+        # banks are sharded along the intermediate axis (per-rank banks), the GPU/CPU
+        # token split is a per-rank local decision, and _maybe_all_reduce merges the
+        # per-rank partial sums. Pure `--moe-cpu-layers` under offload targets the CPU
+        # executor and stays forbidden.
         raise ValueError(
-            "TP > 1 does not support CPU/hybrid MoE decode; run without "
-            "--moe-strategy cpu/hybrid and --moe-cpu-layers"
+            "TP > 1 does not support CPU MoE decode (--moe-cpu-layers with "
+            "--moe-strategy cpu/offload); use --moe-strategy hybrid for CPU/GPU "
+            "co-compute instead"
         )
 
     if is_moe:
