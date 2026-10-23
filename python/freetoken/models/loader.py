@@ -189,14 +189,21 @@ class ShardReader:
         return [name for name, shard in self._map.items() if shard == file]
 
     def get_tensor(self, name: str) -> torch.Tensor:
+        return self._handle(self._map[name]).get_tensor(name)
+
+    def get_slice(self, name: str):
+        """A ``safetensors`` slice over ``name``, so a caller can read only the byte range
+        it needs (TP rank slices) instead of the whole tensor."""
+        return self._handle(self._map[name]).get_slice(name)
+
+    def _handle(self, file: str):
         import safetensors
 
-        file = self._map[name]
         h = self._handles.get(file)
         if h is None:
             h = safetensors.safe_open(file, framework="pt", device=self._device).__enter__()
             self._handles[file] = h
-        return h.get_tensor(name)
+        return h
 
     def close(self) -> None:
         for h in self._handles.values():

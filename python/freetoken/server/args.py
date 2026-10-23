@@ -658,6 +658,18 @@ def parse_args(
             "low-memory reclaimable read (slower); 'parallel' forces the fast read."
         ),
     )
+    parser.add_argument(
+        "--distributed-timeout",
+        type=float,
+        default=ServerArgs.distributed_timeout,
+        help=(
+            "Timeout (seconds) for the TP/Gloo process group: every rank must reach each "
+            "startup all-reduce within this window. Large models whose expert banks read "
+            "from cold storage can exceed the 60s default (e.g. qwen3-235b at TP8 takes "
+            "~10min when the file cache is cold and crashes the run); raise this to match "
+            "the expected load time."
+        ),
+    )
 
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(

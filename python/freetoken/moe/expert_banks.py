@@ -134,13 +134,24 @@ def build_expert_banks(
         if missing:
             raise ValueError(f"expert banks were not filled: {len(missing)} (layer, expert) rows missing (first {missing[:4]})")
 
-    if layer_sink is not None:
-        _fill(layer_sink)
-    elif torch.cuda.is_available():
-        with PinPipeline() as pins:
-            _fill(pins)
-    else:
-        _fill(None)
+    # Packing runs hundreds of tiny per-expert torch ops (zero_/copy_/cat of a few MiB).
+    # With the default intra-op pool on a many-core host, each one pays a 10-20ms
+    # OpenMP barrier (255 threads -> ~25 ms per op, measured as pack alone eating the
+    # whole ~50s/layer of an 8-rank TP load), so pack single-threaded; the GPU decode
+    # paths size their own thread pools and never depend on this one.
+    prev_threads = torch.get_num_threads()
+    if prev_threads > 1:
+        torch.set_num_threads(1)
+    try:
+        if layer_sink is not None:
+            _fill(layer_sink)
+        elif torch.cuda.is_available():
+            with PinPipeline() as pins:
+                _fill(pins)
+        else:
+            _fill(None)
+    finally:
+        torch.set_num_threads(prev_threads)
 
     return ExpertBanks(
         legacy_format_for(method.kind, kernel.name), banks,
