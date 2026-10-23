@@ -3,10 +3,12 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
+from freetoken.distributed import get_tp_info
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
-from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearRowParallel
 from freetoken.layers.quantization import QuantConfig
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
+from freetoken.utils import div_even
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -42,12 +44,14 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         assert head_k_dim == head_v_dim, (
             f"GatedDeltaNet requires head_k_dim == head_v_dim, got {head_k_dim} != {head_v_dim}"
         )
-        self.num_k_heads = num_k_heads
-        self.num_v_heads = num_v_heads
+        # TP-local geometry, matching the state pool's _linear_local_dims shard-for-shard.
+        tp_size = get_tp_info().size
+        self.num_k_heads = div_even(num_k_heads, tp_size, allow_replicate=True)
+        self.num_v_heads = div_even(num_v_heads, tp_size, allow_replicate=True)
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
-        self.key_dim = num_k_heads * head_k_dim
-        self.value_dim = num_v_heads * head_v_dim
+        self.key_dim = self.num_k_heads * head_k_dim
+        self.value_dim = self.num_v_heads * head_v_dim
         self.conv_dim = 2 * self.key_dim + self.value_dim
         self.conv_kernel_size = conv_kernel_size
         # quantized checkpoints quantize qkv|z but not b|a, so the fusion splits into a qkvz GEMM and a ba GEMM with their own schemes (matches sglang / vLLM)
@@ -55,10 +59,16 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             quant_config is not None and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None
         )
 
-        self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
+        # Col-parallel slices each segment contiguously by rank, so segments are declared per
+        # head group (q|k|v|z|b|a), not as the checkpoint's conv|z blocks: over head-sized
+        # segments the contiguous slice is the head-wise split, keeping conv_in a local prefix.
+        q_dim = num_k_heads * head_k_dim
+        v_dim = num_v_heads * head_v_dim
+        # Local dims: torch.split runs on the rank-local GEMM output.
+        self._in_proj_split = [self.conv_dim, self.value_dim, self.num_v_heads, self.num_v_heads]
         if self._split_in_proj:
             self.in_proj_qkvz = LinearColParallelMerged(
-                hidden_size, [self.conv_dim, self.value_dim], has_bias=False,
+                hidden_size, [q_dim, q_dim, v_dim, v_dim], has_bias=False,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj_qkvz",
             )
             self.in_proj_ba = LinearColParallelMerged(
@@ -68,19 +78,21 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
             self.in_proj = LinearColParallelMerged(
-                hidden_size, self._in_proj_split, has_bias=False,
-                quant_config=quant_config, prefix=f"{prefix}.in_proj",
+                hidden_size, [q_dim, q_dim, v_dim, v_dim, num_v_heads, num_v_heads],
+                has_bias=False, quant_config=quant_config, prefix=f"{prefix}.in_proj",
             )
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
         # per-call .float() upcast in the decode wrapper. The weight loader exempts
         # *.A_log / *.dt_bias from the model-dtype downcast.
-        self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
-        self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
+        self.dt_bias = torch.empty(self.num_v_heads, dtype=torch.float32)
+        self.A_log = torch.empty(self.num_v_heads, dtype=torch.float32)
         self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
-        self.out_proj = LinearReplicated(
-            self.value_dim, hidden_size, has_bias=False,
+        # Row-parallel over the value dim: each rank holds its own value columns and the
+        # partial outputs are all-reduced (replicated out_proj would need the full columns).
+        self.out_proj = LinearRowParallel(
+            v_dim, hidden_size, has_bias=False,
             quant_config=quant_config, prefix=f"{prefix}.out_proj",
         )
 

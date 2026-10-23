@@ -31,7 +31,8 @@ H = 128  # hidden_size; every block-fp8 projection needs in/out multiples of 128
 HC = 4  # hc_count
 LR = 320  # hc_lowrank; kept real so the merged HC pad is the real (-(320+4)) % 16 = 12
 HCH = HC * H  # hyper-connection stream width
-KH, VH, HD = 2, 4, 32  # GDN key / value heads, head dim: qkv rows 256, z rows 128
+KH, VH, HD = 4, 4, 32  # GDN key / value heads, head dim: qkv rows 384, z rows 128; each q / v
+# head group is 128 rows so every head-aligned block-fp8 segment stays a 128 multiple
 QH, KVH, AHD = 4, 2, 64  # QSA q / kv heads, head dim: q rows 512, k / v rows 128
 IHD = 64  # indexer head dim
 BLOCK = 128
