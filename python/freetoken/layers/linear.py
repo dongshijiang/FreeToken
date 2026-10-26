@@ -148,9 +148,16 @@ class LinearOProj(_LinearTPImpl):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._tp_size == 1:
+            return self.quant_method.apply(self, x)
+        # every rank's kernel application folds the full bias in, so the all-reduce
+        # would count it world_size times: strip it here and add it back once below
+        bias, self.bias = self.bias, None
         y = self.quant_method.apply(self, x)
-        if self._tp_size > 1:
-            y = self._comm.all_reduce(y)
+        self.bias = bias
+        y = self._comm.all_reduce(y)
+        if bias is not None:
+            y = y + bias.to(y.dtype)
         return y
 
 
@@ -175,7 +182,14 @@ class LinearRowParallel(_LinearTPImpl):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._tp_size == 1:
+            return self.quant_method.apply(self, x)
+        # every rank's kernel application folds the full bias in, so the all-reduce
+        # would count it world_size times: strip it here and add it back once below
+        bias, self.bias = self.bias, None
         y = self.quant_method.apply(self, x)
-        if self._tp_size > 1:
-            y = self._comm.all_reduce(y)
+        self.bias = bias
+        y = self._comm.all_reduce(y)
+        if bias is not None:
+            y = y + bias.to(y.dtype)
         return y
