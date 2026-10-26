@@ -79,16 +79,29 @@ def _write_checkpoint(tmp_path, table, n_shards):
     save_file(tensors, str(tmp_path / "model.safetensors"))
 
 
-def _make_table(tmp_path):
+def _make_table(tmp_path, *, bf16=False):
+    from safetensors.torch import save_file
+
     from freetoken.models.qwen4_exp.ple_disk import DiskRowTable, source_from_safetensors
 
     args = parse_config(toy_hf_config()).qwen4_args
     multipliers, sizes, offsets = hash_constants(args)
     total_rows = int(offsets[-1] + sizes[-1])
     gen = torch.Generator().manual_seed(9)
-    table = torch.randint(0, 256, (total_rows, args.ngram_head_dim), dtype=torch.uint8, generator=gen)
     n_shards = next(k for k in (4, 2, 1) if total_rows % k == 0)
-    _write_checkpoint(tmp_path, table, n_shards)
+    if bf16:
+        # the bf16 releases: bf16 elements, no weight_scale (identity)
+        table = torch.randn(total_rows, args.ngram_head_dim, generator=gen).to(torch.bfloat16)
+        per = total_rows // n_shards
+        save_file(
+            {f"{_KEY_PREFIX}.shard_{i}.weight": table[i * per : (i + 1) * per] for i in range(n_shards)},
+            str(tmp_path / "model.safetensors"),
+        )
+        scale = 1.0
+    else:
+        table = torch.randint(0, 256, (total_rows, args.ngram_head_dim), dtype=torch.uint8, generator=gen)
+        _write_checkpoint(tmp_path, table, n_shards)
+        scale = 0.03125
     constants = {
         "num_ngram_heads": args.num_ngram_heads,
         "layer_multipliers": multipliers.tolist(),
@@ -97,7 +110,7 @@ def _make_table(tmp_path):
         "eos_token_id": EOS,
     }
     disk = DiskRowTable(source_from_safetensors(str(tmp_path)), constants)
-    oracle = GpuResidentTable(table.cuda().view(torch.float8_e4m3fn), scale=0.03125)
+    oracle = GpuResidentTable(table.cuda() if bf16 else table.cuda().view(torch.float8_e4m3fn), scale=scale)
     return disk, oracle, args
 
 
@@ -254,9 +267,33 @@ def test_layouts_readers_and_errors(tmp_path):
         DiskRowTable(source_from_safetensors(str(tmp_path)), constants)
 
 
+def test_bf16_table_rows_are_two_bytes_with_identity_scale(tmp_path):
+    """The bf16 releases store the table with no weight_scale: rows are 2 bytes per element."""
+    from safetensors.torch import save_file
+
+    from freetoken.models.qwen4_exp.ple_disk import source_from_safetensors
+
+    args = parse_config(toy_hf_config()).qwen4_args
+    _multipliers, vocab, offs = hash_constants(args)
+    total_rows = int(offs[-1] + vocab[-1])
+    per = total_rows // 2
+    table = torch.randn(total_rows, args.ngram_head_dim).to(torch.bfloat16)
+    save_file(
+        {f"{_KEY_PREFIX}.shard_{i}.weight": table[i * per : (i + 1) * per] for i in (0, 1)},
+        str(tmp_path / "model.safetensors"),
+    )
+    source = source_from_safetensors(str(tmp_path))
+    assert source.elem_dtype is torch.bfloat16
+    assert source.row_bytes == 2 * args.ngram_head_dim
+    assert source.row_stride == source.row_bytes
+    assert source.rows_per_extent == per
+    assert source.scale == 1.0
+
+
 @requires_cuda
-def test_disk_table_matches_oracle(tmp_path):
-    disk, oracle, args = _make_table(tmp_path)
+@pytest.mark.parametrize("bf16", [False, True])
+def test_disk_table_matches_oracle(tmp_path, bf16):
+    disk, oracle, args = _make_table(tmp_path, bf16=bf16)
     emb = _embedding()
 
     # prefill: two segments, one fresh and one mid-sequence window

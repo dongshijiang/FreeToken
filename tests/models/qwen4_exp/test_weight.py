@@ -15,17 +15,27 @@ import torch
 from safetensors.torch import save_file
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
+from freetoken.distributed.info import DistributedInfo
 from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
 from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
     _DenseFuser,
+    _TpSlicer,
     iter_weights,
     load_ple_table,
 )
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
 
-from .common import LM, RADIXARK_NVFP4, hf_config, install_quant_config, meta_state_dict, mixed_precision_quant
+from .common import (
+    LM,
+    RADIXARK_NVFP4,
+    hf_config,
+    install_quant_config,
+    meta_state_dict,
+    mixed_precision_quant,
+    parsed_config,
+)
 
 H = 128  # hidden_size; every block-fp8 projection needs in/out multiples of 128
 HC = 4  # hc_count
@@ -286,6 +296,17 @@ def test_gdn_in_proj_slices_round_trip(loaded, checkpoint):
         assert torch.equal(part, back)
 
 
+def test_gdn_scalars_upcast_to_the_fp32_params(loaded, checkpoint):
+    """The checkpoint stores A_log/dt_bias in the model dtype; the layer keeps fp32 params."""
+    _folder, raw = checkpoint
+    gdn = f"{LM}.layers.0.linear_attn"
+    for leaf in ("A_log", "dt_bias"):
+        assert raw[f"{gdn}.{leaf}"].dtype == torch.bfloat16
+        got = loaded[f"model.layers.0.linear_attn.{leaf}"]
+        assert got.dtype == torch.float32
+        assert torch.equal(got, raw[f"{gdn}.{leaf}"].float())
+
+
 def test_shared_expert_gate_up_merge(loaded, checkpoint):
     _folder, raw = checkpoint
     base = "model.language_model.layers.1.mlp.shared_expert"
@@ -519,3 +540,249 @@ def test_checkpoint_disagreeing_with_its_quant_config_is_rejected(tmp_path, quan
     (tmp_path / "config.json").write_text(json.dumps(_config_json(quantization_config)))
     with pytest.raises(ValueError, match=match):
         _load(str(tmp_path))
+
+
+# ======================================================================================
+# TP > 1: the slicer cuts, the stacked experts stay replicated
+# ======================================================================================
+
+GDN = "model.layers.0.linear_attn"
+ATTN_LOCAL = "model.layers.1.self_attn"
+
+
+def _tp_config():
+    return parsed_config(
+        num_layers=2, head_dim=AHD, num_q=QH, num_kv=KVH, index_head_dim=IHD, index_heads=2,
+        budget=16, hidden=H, max_position=4096, rope_theta=10000.0,
+        layer_types=["linear_attention", "full_attention"],
+        linear_num_key_heads=KH, linear_num_value_heads=VH,
+        linear_key_head_dim=HD, linear_value_head_dim=HD,
+        hc_lowrank=LR, ple_layer_ids=[1],
+        num_experts=E, moe_intermediate_size=I, shared_expert_intermediate_size=I,
+    )
+
+
+def _slicer_at(monkeypatch, rank: int) -> _TpSlicer:
+    from freetoken.distributed import info
+
+    monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(rank, 2))
+    return _TpSlicer(_tp_config())
+
+
+def test_tp2_gdn_qkv_and_conv_cuts_are_per_segment(monkeypatch):
+    s0, s1 = _slicer_at(monkeypatch, 0), _slicer_at(monkeypatch, 1)
+    qkv = torch.arange(3 * KH * HD * H).view(3 * KH * HD, H).to(torch.bfloat16)
+    conv = torch.arange(3 * KH * HD * 4).view(3 * KH * HD, 1, 4).to(torch.bfloat16)
+    for name, tensor in ((f"{GDN}.in_proj_qkv.weight", qkv), (f"{GDN}.conv1d.weight", conv)):
+        got0, got1 = s0.shard(name, tensor), s1.shard(name, tensor)
+        assert got0.shape[0] == sum(rows // 2 for rows in s0.qkv_rows), name
+        # each rank holds its half of every segment, in q|k|v order, not a flat dim-0 half
+        start = pos = 0
+        for rows in s0.qkv_rows:
+            seg = tensor[start : start + rows]
+            assert torch.equal(got0[pos : pos + rows // 2], seg[: rows // 2]), name
+            assert torch.equal(got1[pos : pos + rows // 2], seg[rows // 2 :]), name
+            pos += rows // 2
+            start += rows
+    with pytest.raises(ValueError, match=r"rows is not the q\|k\|v layout"):
+        s0.shard(f"{GDN}.in_proj_qkv.weight", qkv[:-4])
+
+
+def test_tp2_gdn_row_and_column_cuts(monkeypatch):
+    s0 = _slicer_at(monkeypatch, 0)
+    z = torch.arange(VH * HD * H).view(VH * HD, H).to(torch.bfloat16)
+    ba = torch.arange(VH * H).view(VH, H).to(torch.bfloat16)
+    vec = torch.arange(VH).to(torch.float32)
+    out = torch.arange(H * VH * HD).view(H, VH * HD).to(torch.bfloat16)
+    norm = torch.arange(HD).to(torch.bfloat16)
+    for name, tensor in ((f"{GDN}.in_proj_z.weight", z), (f"{GDN}.in_proj_b.weight", ba),
+                         (f"{GDN}.in_proj_a.weight", ba), (f"{GDN}.dt_bias", vec),
+                         (f"{GDN}.A_log", vec)):
+        assert torch.equal(s0.shard(name, tensor), tensor.chunk(2, dim=0)[0]), name
+    assert torch.equal(s0.shard(f"{GDN}.out_proj.weight", out), out.chunk(2, dim=1)[0])
+    assert torch.equal(s0.shard(f"{GDN}.norm.weight", norm), norm)
+
+
+def test_tp2_attention_cut_is_whole_heads_and_replicates_the_indexer(monkeypatch):
+    s0 = _slicer_at(monkeypatch, 0)
+    # q rows are per-head [q|gate] interleaved: the dim-0 half cut is whole heads
+    q = torch.arange(2 * QH * AHD * H).view(2 * QH * AHD, H).to(torch.bfloat16)
+    assert torch.equal(s0.shard(f"{ATTN_LOCAL}.q_proj.weight", q), q[: QH * AHD])
+    k = torch.arange(KVH * AHD * H).view(KVH * AHD, H).to(torch.bfloat16)
+    assert torch.equal(s0.shard(f"{ATTN_LOCAL}.k_proj.weight", k), k[: KVH * AHD // 2])
+    o = torch.arange(H * QH * AHD).view(H, QH * AHD).to(torch.bfloat16)
+    assert torch.equal(s0.shard(f"{ATTN_LOCAL}.o_proj.weight", o), o[:, : QH * AHD // 2])
+    idx = torch.arange(5 * IHD * H).view(5 * IHD, H).to(torch.bfloat16)
+    assert torch.equal(s0.shard(f"{ATTN_LOCAL}.indexer.index_qk_proj.weight", idx), idx)
+
+
+def _reassemble(rank0: torch.Tensor, rank1: torch.Tensor, parts: list[int]) -> torch.Tensor:
+    """Rebuild a merged buffer whose every part is a dim-0 TP half: each rank stores
+    part0|part1|... halves, so a part comes back from concatenating the two ranks' slots."""
+    halves = [p // 2 for p in parts]
+    slots0 = rank0.split(halves, dim=0)
+    slots1 = rank1.split(halves, dim=0)
+    return torch.cat([torch.cat(pair, dim=0) for pair in zip(slots0, slots1)], dim=0)
+
+
+def test_tp2_visual_shards_follow_the_vision_parallel_classes():
+    from freetoken.models.qwen4_exp.weight import _shard_visual
+
+    # attn.qkv: three equal q|k|v segments, a whole-head cut inside each
+    seg = 4 * 8
+    qkv = torch.arange(3 * seg * 3).view(3 * seg, 3).float()
+    r0 = _shard_visual("visual.blocks.0.attn.qkv.weight", qkv, 0, 2)
+    r1 = _shard_visual("visual.blocks.0.attn.qkv.weight", qkv, 1, 2)
+    assert r0.shape == (3 * seg // 2, 3)
+    half = seg // 2
+    for s in range(3):
+        rank0, rank1 = r0[s * half : (s + 1) * half], r1[s * half : (s + 1) * half]
+        assert torch.equal(torch.cat([rank0, rank1]), qkv[s * seg : (s + 1) * seg])
+    bias = torch.arange(3 * seg).float()
+    b0 = _shard_visual("visual.blocks.0.attn.qkv.bias", bias, 0, 2)
+    want_bias = torch.cat([bias[s * seg : (s + 1) * seg].chunk(2, 0)[0] for s in range(3)])
+    assert torch.equal(b0, want_bias)
+    # attn.proj / linear_fc2: row parallels, bias replicated
+    proj = torch.arange(8 * 6).view(8, 6).float()
+    assert torch.equal(_shard_visual("visual.blocks.0.attn.proj.weight", proj, 0, 2), proj.chunk(2, 1)[0])
+    assert torch.equal(_shard_visual("visual.blocks.0.mlp.linear_fc2.weight", proj, 1, 2), proj.chunk(2, 1)[1])
+    vec = torch.arange(8).float()
+    assert torch.equal(_shard_visual("visual.blocks.0.attn.proj.bias", vec, 1, 2), vec)
+    assert torch.equal(_shard_visual("visual.blocks.0.mlp.linear_fc2.bias", vec, 0, 2), vec)
+    # linear_fc1: a single-segment column cut, bias cut along dim 0 too
+    fc1 = torch.arange(10 * 3).view(10, 3).float()
+    assert torch.equal(_shard_visual("visual.blocks.0.mlp.linear_fc1.weight", fc1, 0, 2), fc1.chunk(2, 0)[0])
+    fb = torch.arange(10).float()
+    assert torch.equal(_shard_visual("visual.blocks.0.mlp.linear_fc1.bias", fb, 1, 2), fb.chunk(2, 0)[1])
+    # conv / pos embed / norms replicate
+    norm = torch.arange(3).float()
+    assert torch.equal(_shard_visual("visual.blocks.0.norm1.weight", norm, 1, 2), norm)
+
+
+def test_tp2_rank_slices_concatenate_back_to_the_tp1_load(monkeypatch, checkpoint):
+    from freetoken.distributed import info
+
+    folder, _raw = checkpoint
+    monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(0, 1))
+    full = _load(folder)
+    monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(0, 2))
+    rank0 = _load(folder)
+    monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(1, 2))
+    rank1 = _load(folder)
+    assert set(rank0) == set(rank1) == set(full)
+    slicer = _TpSlicer(_tp_config())
+    in_proj_rows = sum(rows // 2 for rows in slicer.qkv_rows) + VH * HD // 2 + VH  # qkv, z, b, a
+    assert rank0["model.layers.0.linear_attn.in_proj.weight"].shape == (in_proj_rows, H)
+    assert rank0["model.layers.0.linear_attn.conv1d.weight"].shape == (sum(r // 2 for r in slicer.qkv_rows), 1, 4)
+    assert rank0["model.layers.1.self_attn.qkv_proj.weight"].shape == (QH * AHD + KVH * AHD, H)
+    assert rank0["model.layers.0.linear_attn.out_proj.weight"].shape == (H, VH * HD // 2)
+    cut1 = {f"model.layers.{l}.mlp.shared_expert.down_proj.weight" for l in (0, 1)}
+    cut1 |= {"model.layers.0.linear_attn.out_proj.weight", "model.layers.1.self_attn.o_proj.weight"}
+    cut1 |= {n for n in full if n.startswith("visual.") and n.endswith(("attn.proj.weight", "linear_fc2.weight"))}
+    cut0 = {
+        "model.embed_tokens.weight", "lm_head.weight",
+        "model.layers.0.linear_attn.dt_bias", "model.layers.0.linear_attn.A_log",
+    }
+    cut0 |= {n for n in full if n.startswith("visual.") and n.endswith(("linear_fc1.weight", "linear_fc1.bias"))}
+    # merged buffers: every part is cut per rank, so a rank holds part-halves in merge order
+    segmented = {
+        "model.layers.0.linear_attn.in_proj.weight": [*slicer.qkv_rows, VH * HD, VH, VH],
+        "model.layers.0.linear_attn.conv1d.weight": list(slicer.qkv_rows),
+        "model.layers.1.self_attn.qkv_proj.weight": [2 * QH * AHD, KVH * AHD, KVH * AHD],
+        **{f"model.layers.{l}.mlp.shared_expert.gate_up_proj.weight": [I, I] for l in (0, 1)},
+        **{n: [whole.shape[0] // 3] * 3 for n, whole in full.items()
+           if n.startswith("visual.") and n.endswith(("attn.qkv.weight", "attn.qkv.bias"))},
+    }
+    for name, whole in full.items():
+        if name in segmented:
+            assert torch.equal(_reassemble(rank0[name], rank1[name], segmented[name]), whole), name
+        elif name in cut0:
+            assert torch.equal(torch.cat([rank0[name], rank1[name]], dim=0), whole), name
+        elif name in cut1:
+            assert torch.equal(torch.cat([rank0[name], rank1[name]], dim=1), whole), name
+        else:
+            assert torch.equal(rank0[name], whole) and torch.equal(rank1[name], whole), name
+
+
+@pytest.fixture(scope="module")
+def stacked_checkpoint(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
+    """The bf16 release layout: pre-stacked routed experts next to the usual dense tensors.
+
+    Seeded like ``checkpoint`` so every dense tensor matches it and the TP1 no-regression
+    assertion below can compare the two loads key by key.
+    """
+    torch.manual_seed(0)
+    raw = _raw_checkpoint()
+    for layer in (0, 1):
+        raw[f"{LM}.layers.{layer}.mlp.experts.gate_up_proj"] = _bf16(E, 2 * I, H)
+        raw[f"{LM}.layers.{layer}.mlp.experts.down_proj"] = _bf16(E, H, I)
+    folder, stored = _write_checkpoint(tmp_path_factory.mktemp("qwen4_exp_stacked_ckpt"), raw, None)
+    for key in STACKED_KEYS:  # expose the stacked tensors under the emitted names too
+        stored[key] = stored[f"{LM}.{key.split('.', 1)[1]}"]
+    return folder, stored
+
+
+STACKED_KEYS = {
+    f"model.layers.{layer}.mlp.experts.{leaf}"
+    for layer in (0, 1) for leaf in ("gate_up_proj", "down_proj")
+}
+
+
+def test_tp1_stacked_experts_load_alongside_the_dense_fusions(stacked_checkpoint, loaded, checkpoint):
+    folder, raw = stacked_checkpoint
+    full = _load(folder)
+    assert set(full) - set(loaded) == STACKED_KEYS
+    for name, tensor in full.items():
+        if name in STACKED_KEYS:
+            assert torch.equal(tensor, raw[name])
+        else:
+            assert torch.equal(tensor, loaded[name]), name
+
+
+def _want_stacked_shard(name: str, whole: torch.Tensor, rank: int) -> torch.Tensor:
+    """The offload banks shard experts on the intermediate axis (MoEConfig.local_intermediate):
+    each rank keeps its gate|up rows together and the matching down columns."""
+    i0 = I // 2
+    if name.endswith("gate_up_proj"):
+        return torch.cat(
+            [whole[:, rank * i0:(rank + 1) * i0], whole[:, I + rank * i0:I + (rank + 1) * i0]], dim=1
+        )
+    return whole[..., rank * i0:(rank + 1) * i0]
+
+
+def test_tp2_stacked_experts_follow_the_bank_intermediate_shard(monkeypatch, stacked_checkpoint):
+    from freetoken.distributed import info
+
+    folder, raw = stacked_checkpoint
+    for rank in (0, 1):
+        monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(rank, 2))
+        got = _load(folder)
+        for key in STACKED_KEYS:
+            want = _want_stacked_shard(key, raw[key], rank)
+            assert got[key].shape == want.shape, key  # a replicated or dim-0 down cut would show here
+            assert torch.equal(got[key], want), key
+
+
+def test_tp2_experts_only_load_yields_just_the_stacked_experts(monkeypatch, stacked_checkpoint):
+    from freetoken.distributed import info
+
+    folder, raw = stacked_checkpoint
+    monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(0, 2))
+    got = {
+        name: tensor.clone()
+        for name, tensor in iter_weights(
+            folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=False
+        )
+    }
+    assert set(got) == STACKED_KEYS
+    for name, tensor in got.items():
+        assert torch.equal(tensor, _want_stacked_shard(name, raw[name], 0)), name
+
+
+def test_tp2_quantized_checkpoint_stays_tp1_only(monkeypatch, checkpoint_fp8):
+    from freetoken.distributed import info
+
+    folder, _raw = checkpoint_fp8
+    monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(0, 2))
+    with pytest.raises(NotImplementedError, match="TP=1"):
+        list(iter_weights(folder, torch.device("cpu"), include_moe_experts=False, include_non_moe=True))
