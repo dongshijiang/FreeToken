@@ -60,6 +60,7 @@ const auto kNCCLDtypeMap =
     std::unordered_map<DLDataType, ncclDataType_t, DLDataTypeHash>{
         {{DLDataTypeCode::kDLFloat, 16, 1}, ncclFloat16},
         {{DLDataTypeCode::kDLBfloat, 16, 1}, ncclBfloat16},
+        {{DLDataTypeCode::kDLInt, 32, 1}, ncclInt32},
     };
 
 using std::shared_ptr;
@@ -160,6 +161,25 @@ public:
         /*stream=*/stream));
   }
 
+  auto broadcast(tvm::ffi::TensorView t) const -> void {
+    using namespace host;
+    RuntimeCheck(t.device().device_type == kDLCUDA,
+                 "Tensor must be on CUDA device");
+    RuntimeCheck(t.is_contiguous(), "Tensor must be contiguous");
+    const auto size_dim = static_cast<size_t>(t.shape().Product());
+    const auto dtype = kNCCLDtypeMap.at(t.dtype());
+    const auto stream = LaunchKernel::resolve_device(t.device());
+    // in-place, root 0: every rank passes its own buffer, rank 0's wins
+    NCCL_CHECK(::ncclBroadcast(
+        /*sendbuff=*/t.data_ptr(),
+        /*recvbuff=*/t.data_ptr(),
+        /*count=*/size_dim,
+        /*datatype=*/dtype,
+        /*root=*/0,
+        /*comm=*/m_comm.get(),
+        /*stream=*/stream));
+  }
+
   auto get_buffer() const -> void * { return m_sym_mem.get(); }
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("freetoken.NCCLWrapper", NCCLWrapper,
@@ -180,6 +200,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def(refl::init<int, int, size_t, NCCLIDList>(), "__init__")
       .def("all_reduce", &NCCLWrapper::all_reduce)
       .def("all_gather", &NCCLWrapper::all_gather)
+      .def("broadcast", &NCCLWrapper::broadcast)
       .def("get_buffer", &NCCLWrapper::get_buffer);
 }
 

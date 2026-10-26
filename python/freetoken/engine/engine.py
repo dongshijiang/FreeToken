@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
-from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, get_tp_info, set_tp_info
+from freetoken.distributed import DistributedCommunicator, destroy_distributed, enable_pynccl_distributed, get_tp_info, set_tp_info
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
@@ -1064,6 +1064,10 @@ class Engine:
 
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if get_tp_info().size > 1:
+            # stochastic sampling draws from per-rank RNG state, so the ranks can
+            # disagree on the token; publish rank 0's draw or the KV caches diverge
+            DistributedCommunicator().broadcast(next_tokens_gpu)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)

@@ -20,6 +20,9 @@ class DistributedImpl(ABC):
     @abstractmethod
     def all_gather(self, x: torch.Tensor) -> torch.Tensor: ...
 
+    @abstractmethod
+    def broadcast(self, x: torch.Tensor) -> torch.Tensor: ...
+
 
 @dataclass
 class TorchDistributedImpl(DistributedImpl):
@@ -40,6 +43,13 @@ class TorchDistributedImpl(DistributedImpl):
         dist.all_gather_into_tensor(out, x)
         return out
 
+    def broadcast(self, x: torch.Tensor) -> torch.Tensor:
+        tp_size = dist.get_world_size()
+        if tp_size == 1:
+            return x
+        dist.broadcast(x, src=0)
+        return x
+
 
 @dataclass
 class PyNCCLDistributedImpl(DistributedImpl):
@@ -59,6 +69,10 @@ class PyNCCLDistributedImpl(DistributedImpl):
         self.comm.all_gather(result, x)
         return result
 
+    def broadcast(self, x: torch.Tensor) -> torch.Tensor:
+        self.comm.broadcast(x)
+        return x
+
 
 class DistributedCommunicator:
     plugins: List[DistributedImpl] = [TorchDistributedImpl()]
@@ -68,6 +82,9 @@ class DistributedCommunicator:
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
         return self.plugins[-1].all_gather(x)
+
+    def broadcast(self, x: torch.Tensor) -> torch.Tensor:
+        return self.plugins[-1].broadcast(x)
 
 
 def enable_pynccl_distributed(
