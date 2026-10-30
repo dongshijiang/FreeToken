@@ -95,6 +95,11 @@ def _determine_cuda_graph_bs(
         return []
 
     candidates = [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
+    if cuda_graph_max_bs not in candidates:
+        # Non-multiple-of-8 max: pad_batch guarantees graph use for every bs <= max
+        # (replay asserts can_use_cuda_graph), so the max itself must be captured --
+        # otherwise the top sizes silently fall back to eager decode.
+        candidates.append(cuda_graph_max_bs)
     return [bs for bs in candidates if bs <= cuda_graph_max_bs]
 
 
