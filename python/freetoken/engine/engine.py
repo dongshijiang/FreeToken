@@ -37,6 +37,13 @@ from freetoken.kvcache.linear_state_pool import (
 
 logger = init_logger(__name__)
 
+# Measurement-only per-step profiler (FREETOKEN_ENGINE_DIAG=1): pairs consecutive
+# decode forwards with a CUDA event to get the true per-step device period, bucketed
+# by batch size, and periodically dumps it together with the MoE cache's decode
+# miss-rate counters to /tmp/engine_diag_*.json. Event reads sync the stream; do
+# not enable in production.
+_ENGINE_DIAG = os.environ.get("FREETOKEN_ENGINE_DIAG", "") == "1"
+
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
     """The offload MoE cache needs at least one slot per expert per layer. A too-small size
     (e.g. a bare offload run with moe_cache_size unset and auto disabled) must fail loudly."""
@@ -741,7 +748,10 @@ class Engine:
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
-        cache.collect_stats = config.moe_collect_stats
+        cache.collect_stats = (
+            config.moe_collect_stats
+            or os.environ.get("FREETOKEN_MOE_COLLECT_STATS", "") == "1"
+        )
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):
@@ -1054,6 +1064,8 @@ class Engine:
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        if _ENGINE_DIAG:
+            self._diag_step(batch, use_graph)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1068,6 +1080,80 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _diag_step(self, batch: Batch, use_graph: bool) -> None:
+        """FREETOKEN_ENGINE_DIAG only: per-decode-step device period bucketed by batch
+        size, in-graph MoE stage sums (span/submit/sync, read one step late -- the
+        previous replay is complete because the scheduler awaited its tokens), and the
+        MoE miss counters; dumped every 100 steps to /tmp."""
+        if not hasattr(self, "_diag"):
+            import collections
+            import json
+            import time
+
+            self._diag = {
+                "t": collections.defaultdict(lambda: [0.0, 0]),
+                "g": collections.defaultdict(lambda: [0.0, 0.0, 0.0, 0]),
+                "prev2": None, "prev1": None, "prev_graph": False,
+                "steps": 0, "last_dump": 0.0,
+                "json": json, "time": time,
+            }
+        d = self._diag
+        # in-graph MoE stage sums of the PREVIOUS step (its events are complete now)
+        if d["prev_graph"] and d["prev2"] is not None and d["prev1"] is not None:
+            try:
+                from freetoken.layers.moe import _HYBRID_DIAG_GRAPH, _GRAPH_DIAG
+                if _HYBRID_DIAG_GRAPH:
+                    stages = _GRAPH_DIAG.read_completed()
+                    if stages:
+                        acc = d["g"][int(d["prev_bs"])]
+                        for span, sub, sync in stages.values():
+                            acc[0] += span
+                            acc[1] += sub
+                            acc[2] += sync
+                        acc[3] += 1
+            except Exception:
+                pass
+        d["prev_graph"] = use_graph
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record(self.stream)
+        if d["prev2"] is not None and d["prev1"] is not None:
+            try:
+                dt = d["prev2"].elapsed_time(d["prev1"])
+                acc = d["t"][int(d["prev_bs"])]
+                acc[0] += dt
+                acc[1] += 1
+                d["steps"] += 1
+            except Exception:
+                pass
+        d["prev2"], d["prev1"], d["prev_bs"] = d["prev1"], ev, int(batch.size)
+        now = d["time"].perf_counter()
+        if d["steps"] and now - d["last_dump"] > 10.0:
+            d["last_dump"] = now
+            rank = ""
+            try:
+                rank = f"_r{get_tp_info().rank}"
+            except Exception:
+                pass
+            out = {
+                "pid": os.getpid(),
+                "steps": d["steps"],
+                "step_ms_by_bs": {
+                    bs: round(v[0] / v[1], 2) for bs, v in sorted(d["t"].items())
+                },
+                "count_by_bs": {bs: v[1] for bs, v in sorted(d["t"].items())},
+                "moe_stage_ms_by_bs": {
+                    bs: {"span": round(v[0] / v[3], 2), "submit": round(v[1] / v[3], 2),
+                         "sync": round(v[2] / v[3], 2), "n": v[3]}
+                    for bs, v in sorted(d["g"].items()) if v[3]
+                },
+            }
+            if self.moe_offload_cache is not None:
+                try:
+                    out["miss_stats"] = self.moe_offload_cache.decode_miss_stats()
+                except Exception as e:
+                    out["miss_stats_err"] = str(e)
+            d["json"].dump(out, open(f"/tmp/engine_diag{rank}_{os.getpid()}.json", "w"), indent=1)
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

@@ -852,7 +852,7 @@ class OffloadMoeCache:
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
 
-    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor, top_k: int = 0) -> None:
         """Capped-fetch LRU for the hybrid backend.
 
         Like :meth:`ensure_experts` but assigns slots to (and schedules copies for) at
@@ -861,7 +861,12 @@ class OffloadMoeCache:
         left non-resident and ``expert_ids`` is rewritten to their cache slot (hit or
         freshly fetched) or ``-1`` (overflow -> compute on the CPU). ``num_indices`` holds
         the capped fetch count (for ``copy_missing``); ``num_missing_full`` the pre-cap
-        miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe."""
+        miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe.
+
+        ``top_k`` > 0 gates the lone-miss floor: single-token steps (``num_active <=
+        top_k``) always fetch at least one miss -- there the PCIe link is idle and the
+        GPU is strictly faster than the CPU; multi-token steps don't floor (a small-m
+        step is faster on the CPU under load). 0 keeps the pure-fraction behavior."""
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
         if self.collect_decode_freq:
@@ -870,7 +875,7 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts_hybrid(
-            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
+            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction, top_k
         )
 
     def materialize_layer(self, layer_id: int) -> None:

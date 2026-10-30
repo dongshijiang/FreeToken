@@ -41,7 +41,8 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
 
 
 def ensure_experts_hybrid(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0,
+    top_k: int = 0
 ) -> None:
     """Capped-fetch variant of ``ensure_experts`` (hybrid backend).
 
@@ -52,12 +53,14 @@ def ensure_experts_hybrid(
     split (fraction = pcie_bw / cpu_bw): fetch ~fraction of the step's misses, rounded to
     the integer that makes the PCIe fetch and the CPU overflow compute finish closest to
     together. ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
-    pre-cap miss count (stats)."""
+    pre-cap miss count (stats). ``top_k`` > 0 gates a lone-miss floor to single-token
+    steps (``num_active <= top_k``) -- there the PCIe link is idle and the GPU beats the
+    CPU on a lone miss; multi-token steps don't floor. 0 disables the floor."""
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
     frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
     if not expert_ids.is_cuda:
-        return _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
-    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
+        return _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, frac_q16, top_k)
+    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16, top_k)
 
 
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
@@ -95,7 +98,7 @@ def reset_cache(cache) -> None:
 
 
 def _ensure_experts_hybrid_gpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int, top_k: int
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
@@ -116,6 +119,7 @@ def _ensure_experts_hybrid_gpu(
         expert_ids.numel(),
         int(max_fetch),
         int(frac_q16),
+        int(top_k),
         cache.num_experts,
         cache.cache_size,
         BLOCK_E=block_e,
@@ -126,7 +130,7 @@ def _ensure_experts_hybrid_gpu(
 
 
 def _ensure_experts_hybrid_cpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int, top_k: int
 ) -> None:
     """CPU reference mirror of the hybrid kernel (eviction/fetch decisions bit-identical to
     the GPU path; see tests/test_offload_lru_kernels.py). Fetches at most ``max_fetch`` (or
@@ -160,6 +164,9 @@ def _ensure_experts_hybrid_cpu(
         lo = (m * frac_q16) >> 16
         cost = lambda f: max(f * (q - frac_q16), (m - f) * frac_q16)  # noqa: E731
         max_fetch = lo if cost(lo) <= cost(lo + 1) else lo + 1
+        if top_k and expert_ids.numel() <= top_k:
+            # Lone-miss floor, gated to single-token steps (see the GPU kernel comment).
+            max_fetch = max(int(max_fetch), 1)
     num_fetch = min(len(missing), int(max_fetch))
     cache.num_missing_full.fill_(len(missing))
     cache.num_indices.fill_(num_fetch)
@@ -287,7 +294,7 @@ def _materialize_layer_kernel(
 
 
 
-@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16"])
+@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16", "top_k"])
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
     slot_for_id_ptr,
@@ -304,6 +311,7 @@ def _ensure_experts_hybrid_kernel(
     num_active,
     max_fetch,
     fetch_frac_q16,
+    top_k,
     num_experts: tl.constexpr,
     cache_size: tl.constexpr,
     BLOCK_E: tl.constexpr,
@@ -352,6 +360,14 @@ def _ensure_experts_hybrid_kernel(
             (lo + 1) * ((1 << 16) - fetch_frac_q16), (num_missing - lo - 1) * fetch_frac_q16
         )
         max_fetch = tl.where(cost_lo <= cost_hi, lo, lo + 1)
+        # Lone-miss floor, gated to single-token steps (num_active <= top_k): there the
+        # PCIe link is idle, so fetching a lone miss is free bandwidth-wise and the GPU
+        # computes it strictly faster than the CPU. Under load (multi-token steps) a
+        # small-m step is faster computed on the CPU, so no floor -- an unconditional
+        # one measurably drags high concurrency back to the fixed-cap level.
+        # top_k == 0 (unknown) disables the floor.
+        floor = tl.where(num_active <= top_k, 1, 0)
+        max_fetch = tl.maximum(max_fetch, floor)
     num_fetch = tl.minimum(num_missing, max_fetch)
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
     tl.store(num_indices_ptr, num_fetch.to(tl.int64))

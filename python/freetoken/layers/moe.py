@@ -25,6 +25,147 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 
+# Measurement-only stage profiler for the hybrid decode path (FREETOKEN_HYBRID_DIAG=1).
+# Host-timers around ensure/submit/decode_sync and CUDA-event pairs around
+# copy_missing / _expert_gemm, accumulated across steps and periodically dumped to
+# /tmp/hybrid_diag_*.json (together with the cache's decode miss-rate counters).
+# The timers only execute when the Python runs, so profile with decode outside CUDA
+# graph capture (e.g. --cuda-graph-bs 0); do not enable in production.
+_HYBRID_DIAG = os.getenv("FREETOKEN_HYBRID_DIAG", "") == "1"
+if _HYBRID_DIAG:
+    import collections
+    import json as _json
+    import time as _time
+
+    class _HybridDiag:
+        def __init__(self):
+            self.lock = collections.defaultdict(float)  # name -> total ms
+            self.cnt = collections.defaultdict(int)
+            self.dev_ms = collections.defaultdict(float)
+            self.steps = 0
+            self._t = 0.0
+            self._t_step = 0.0
+            self.step_total = 0.0
+            self._pending = []  # (name, start_ev, end_ev)
+            self._dumped = 0.0
+
+        def step_begin(self):
+            self._t_step = _time.perf_counter()
+
+        def mark(self):
+            self._t = _time.perf_counter()
+
+        def host(self, name):
+            t1 = _time.perf_counter()
+            self.lock[name] += (t1 - self._t) * 1e3
+            self.cnt[name] += 1
+            self._t = t1
+
+        def dev_begin(self, name):
+            a = torch.cuda.Event(enable_timing=True)
+            b = torch.cuda.Event(enable_timing=True)
+            a.record()
+            self._pending.append((name, a, b))
+            return b  # caller records b after the stage
+
+        def dev_end(self, ev):
+            ev.record()
+
+        def step_done(self, cache):
+            # one full pass over all MoE layers == one decode step: sync once,
+            # read every event pair, then rotate counters into per-step averages
+            if len(self._pending) < 2 * cache.num_layers:
+                return
+            torch.cuda.synchronize()
+            for name, a, b in self._pending:
+                self.dev_ms[name] += a.elapsed_time(b)
+            self._pending = []
+            self.steps += 1
+            self.step_total += (_time.perf_counter() - self._t_step) * 1e3
+            now = _time.perf_counter()
+            if now - self._dumped > 10.0:
+                self._dumped = now
+                self.dump(cache)
+
+        def dump(self, cache):
+            rank = os.environ.get("RANK", "x")
+            d = {
+                "pid": os.getpid(),
+                "steps": self.steps,
+                "step_wall_ms_avg": round(self.step_total / max(self.steps, 1), 2),
+                "host_ms_total": {k: round(v, 1) for k, v in self.lock.items()},
+                "dev_ms_total": {k: round(v, 1) for k, v in self.dev_ms.items()},
+                "per_step_ms": {
+                    "host": {k: round(v / max(self.cnt[k], 1) * cache.num_layers, 3)
+                             for k, v in self.lock.items()},
+                    "dev": {k: round(v / max(self.steps, 1), 3)
+                            for k, v in self.dev_ms.items()},
+                },
+            }
+            try:
+                d["miss_stats"] = cache.decode_miss_stats()
+            except Exception as e:  # pragma: no cover - diagnostic only
+                d["miss_stats_err"] = str(e)
+            _json.dump(d, open(f"/tmp/hybrid_diag_r{rank}_{os.getpid()}.json", "w"), indent=1)
+
+    _HYBRID_DIAG_STATE = _HybridDiag()
+
+# In-graph stage profiler (FREETOKEN_HYBRID_DIAG_GRAPH=1): one global set of
+# per-layer event pairs captured INTO every decode graph; each replay re-records
+# them, so after any replay the pair values describe that replay. engine._diag_step
+# reads them one step late (previous replay is complete by then) and buckets by
+# batch size. SIGUSR1 dumps the last replay to /tmp/graph_diag_*.json.
+# Safe to run with CUDA graphs on; do not enable in production.
+_HYBRID_DIAG_GRAPH = os.getenv("FREETOKEN_HYBRID_DIAG_GRAPH", "") == "1"
+if _HYBRID_DIAG_GRAPH:
+    import json as _gjson
+    import signal as _gsignal
+
+    class _GraphDiag:
+        def __init__(self):
+            self.events = {}  # layer_id -> event dict
+
+        def layer_events(self, layer_id):
+            evs = self.events.get(layer_id)
+            if evs is None:
+                mk = lambda: torch.cuda.Event(enable_timing=True)  # noqa: E731
+                evs = {k: mk() for k in ("entry", "sub_a", "sub_b", "sync_a", "sync_b", "exit")}
+                self.events[layer_id] = evs
+            return evs
+
+        def read_completed(self):
+            """(span, submit, sync) ms per layer from the last replay, or None if any
+            layer has no recorded pair yet."""
+            out = {}
+            for lid, evs in self.events.items():
+                try:
+                    span = evs["entry"].elapsed_time(evs["exit"])
+                    sub = evs["sub_a"].elapsed_time(evs["sub_b"])
+                    sync = evs["sync_a"].elapsed_time(evs["sync_b"])
+                except Exception:
+                    return None
+                out[lid] = (span, sub, sync)
+            if len(out) != 43 and len(out) == 0:
+                return None
+            return out
+
+        def dump(self, *_):
+            rank = os.environ.get("RANK", "x")
+            layers = {}
+            for lid, evs in sorted(self.events.items()):
+                def el(a, b, _evs=evs):
+                    try:
+                        return round(_evs[a].elapsed_time(_evs[b]), 4)
+                    except Exception:
+                        return None
+                layers[lid] = {"span": el("entry", "exit"), "submit": el("sub_a", "sub_b"),
+                               "sync": el("sync_a", "sync_b")}
+            _gjson.dump({"layers": layers},
+                        open(f"/tmp/graph_diag_r{rank}_{os.getpid()}.json", "w"))
+
+    _GRAPH_DIAG = _GraphDiag()
+    _gsignal.signal(_gsignal.SIGUSR1, _GRAPH_DIAG.dump)
+
 
 class MoELayer(BaseOP):
     """Resident routed experts.
@@ -314,13 +455,31 @@ class OffloadMoELayer(MoELayer):
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
         raw = topk_ids.clone()  # raw expert ids for the CPU partial
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
+        if _HYBRID_DIAG_GRAPH:
+            _gev = _GRAPH_DIAG.layer_events(self.layer_id)
+            _gev["entry"].record()
+        if _HYBRID_DIAG:
+            _diag = _HYBRID_DIAG_STATE
+            if self.layer_id == 0:
+                _diag.step_begin()
+            _diag.mark()
+        cache.ensure_experts_hybrid(self.layer_id, topk_ids, top_k=self.top_k)  # -> slot (hit/fetched) or -1
+        if _HYBRID_DIAG:
+            _diag.host("ensure")
         if cache.collect_stats:
             cache.record_decode_stats_hybrid(self.layer_id)
         on_gpu = topk_ids >= 0
 
         cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
+        if _HYBRID_DIAG_GRAPH:
+            _gev["sub_a"].record()
+        if _HYBRID_DIAG:
+            _diag.mark()
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
+        if _HYBRID_DIAG_GRAPH:
+            _gev["sub_b"].record()
+        if _HYBRID_DIAG:
+            _diag.host("submit")
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
         # PCIe fetch + GPU GEMM, serializing the two so an A/B isolates the overlap win.
@@ -328,9 +487,15 @@ class OffloadMoELayer(MoELayer):
             executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
         )
 
+        if _HYBRID_DIAG:
+            _ev = _diag.dev_begin("fetch")
         cache.copy_missing()
+        if _HYBRID_DIAG:
+            _diag.dev_end(_ev)
         gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
         gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
+        if _HYBRID_DIAG:
+            _ev = _diag.dev_begin("gemm")
         gpu_routed = self._expert_gemm(
             cache,
             hidden_states,
@@ -341,8 +506,20 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+        if _HYBRID_DIAG:
+            _diag.dev_end(_ev)
+        if _HYBRID_DIAG_GRAPH:
+            _gev["sync_a"].record()
         cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
-        return gpu_routed + cpu_routed
+        if _HYBRID_DIAG_GRAPH:
+            _gev["sync_b"].record()
+        if _HYBRID_DIAG:
+            _diag.host("cpu_wait")
+            _diag.step_done(cache)
+        out = gpu_routed + cpu_routed
+        if _HYBRID_DIAG_GRAPH:
+            _gev["exit"].record()
+        return out
 
     def _prefill_routed(
         self,

@@ -17,17 +17,25 @@ from freetoken.moe.offload_cache import OffloadMoeCache
 Q = 1 << 16
 
 
-def _balanced_fetch(num_missing: int, frac_q16: int) -> int:
+def _balanced_fetch(num_missing: int, frac_q16: int, floor: int = 0) -> int:
     """Reference split: F ~ frac * misses, rounded to whichever integer neighbor
-    minimizes the slower overlapped side (fetch ~ F*(1-frac), CPU ~ (M-F)*frac)."""
+    minimizes the slower overlapped side (fetch ~ F*(1-frac), CPU ~ (M-F)*frac).
+    ``floor`` (the lone-miss floor) lifts the result to at least 1 whenever there is
+    a miss; production gates it to single-token steps (num_active <= top_k) -- there
+    the PCIe link is idle and the GPU computes a lone miss strictly faster than the
+    CPU, so never round to 0. Multi-token steps stay on the pure fraction."""
+    if num_missing <= 0:
+        return 0
     lo = (num_missing * frac_q16) >> 16
     cost = lambda f: max(f * (Q - frac_q16), (num_missing - f) * frac_q16)  # noqa: E731
-    return min(num_missing, lo if cost(lo) <= cost(lo + 1) else lo + 1)
+    return min(num_missing, max(floor, lo if cost(lo) <= cost(lo + 1) else lo + 1))
 
 
 def test_balanced_fetch_tracks_fraction():
     # The split follows fetched : cpu = pcie : (cpu - pcie) up to integer rounding, and
-    # never over/under-shoots by more than one expert.
+    # never over/under-shoots by more than one expert. Pure fraction (floor 0) may
+    # round a small-m step to 0 -- that is the point: under load the CPU is faster on
+    # a lone miss.
     for frac in (0.1, 0.415, 0.454, 0.7, 1.0):
         q = round(frac * Q)
         for m in range(0, 65):
@@ -38,6 +46,12 @@ def test_balanced_fetch_tracks_fraction():
     # 1.24 -> fetching 2 makes the PCIe side ~1.6x slower than balance; keep it at 1.
     assert _balanced_fetch(3, round(0.415 * Q)) == 1
     assert _balanced_fetch(4, round(0.415 * Q)) == 2
+    # ... and the floor keeps a lone miss on the fast path for single-token steps
+    # (the c1 regression fix), but only there:
+    assert _balanced_fetch(1, round(0.189 * Q), floor=1) == 1
+    assert _balanced_fetch(2, round(0.1 * Q), floor=1) == 1
+    assert _balanced_fetch(0, round(0.189 * Q), floor=1) == 0
+    assert _balanced_fetch(1, round(0.189 * Q)) == 0
 
 
 def test_load_hybrid_fetch_fraction(tmp_path):
@@ -97,22 +111,37 @@ def test_hybrid_fraction_gpu_matches_cpu_reference():
             hybrid_max_fetch=num_experts, hybrid_fetch_fraction=frac,
         )
 
-    gpu, ref = make(), make()
     frac_q16 = round(frac * Q)
+    # Single-token steps (num_active == top_k): the lone-miss floor applies.
+    gpu, ref = make(), make()
     for step in range(64):
         ids = torch.randperm(num_experts)[:top_k].to(torch.int32)
         g, c = ids.clone().cuda(), ids.clone()  # a CPU ids tensor drives the reference path
-        gpu.ensure_experts_hybrid(0, g)
-        ref.ensure_experts_hybrid(0, c)
+        gpu.ensure_experts_hybrid(0, g, top_k=top_k)
+        ref.ensure_experts_hybrid(0, c, top_k=top_k)
         missing = int(gpu.num_missing_full.item())
         fetched = int(gpu.num_indices.item())
         assert missing == int(ref.num_missing_full.item())
-        assert fetched == int(ref.num_indices.item()) == _balanced_fetch(missing, frac_q16)
+        assert fetched == int(ref.num_indices.item()) == _balanced_fetch(missing, frac_q16, floor=1)
         # slot rewrites (hit/fetched -> slot, overflow -> -1) and LRU state stay identical
         assert torch.equal(g.cpu(), c)
         assert torch.equal(gpu.slot_for_id.cpu(), ref.slot_for_id.cpu())
         assert torch.equal(gpu.id_of_slot.cpu(), ref.id_of_slot.cpu())
         assert (g >= 0).sum().item() == len(set(ids.tolist())) - (missing - fetched)
+    # Multi-token steps (num_active > top_k): no floor, the pure fraction rules.
+    gpu, ref = make(), make()
+    for step in range(64):
+        ids = torch.randperm(num_experts)[: 2 * top_k].to(torch.int32)
+        g, c = ids.clone().cuda(), ids.clone()
+        gpu.ensure_experts_hybrid(0, g, top_k=top_k)
+        ref.ensure_experts_hybrid(0, c, top_k=top_k)
+        missing = int(gpu.num_missing_full.item())
+        fetched = int(gpu.num_indices.item())
+        assert missing == int(ref.num_missing_full.item())
+        assert fetched == int(ref.num_indices.item()) == _balanced_fetch(missing, frac_q16)
+        assert torch.equal(g.cpu(), c)
+        assert torch.equal(gpu.slot_for_id.cpu(), ref.slot_for_id.cpu())
+        assert torch.equal(gpu.id_of_slot.cpu(), ref.id_of_slot.cpu())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
