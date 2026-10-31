@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import signal
 import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -112,6 +113,15 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
         if args.silent_output:
             logging.disable(logging.INFO)
 
+        # The API shutdown path SIGTERMs workers. Convert that to KeyboardInterrupt so
+        # run_forever unwinds through Scheduler.shutdown (HiCache persistence, barriers).
+        def _terminate_to_keyboard(signum, frame):
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGTERM, _terminate_to_keyboard)
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, _terminate_to_keyboard)
+
         try:
             scheduler.run_forever()
         except KeyboardInterrupt:
@@ -119,7 +129,13 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
             if args.tp_info.is_primary():
                 print()  # for a clean newline after ^C
                 logger.info("Scheduler exiting gracefully...")
-            scheduler.shutdown()
+        finally:
+            # Persist HiCache host pages on every orderly worker exit, including SIGTERM
+            # from the API shutdown path.
+            try:
+                scheduler.shutdown()
+            except Exception:
+                logger.exception("scheduler shutdown failed")
 
 
 def launch_server(

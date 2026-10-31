@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 from freetoken.core import Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
-from freetoken.utils import align_down, div_ceil
+from freetoken.utils import align_down, div_ceil, init_logger
 
 if TYPE_CHECKING:
     from .utils import PendingReq
@@ -28,10 +28,13 @@ _SWA_EVICTION_INTERVAL = _swa_eviction_interval()
 # the client drops reasoning (Qwen's "<think>\n": the re-render diverges 2 tokens BEFORE P).
 _SWA_RETAIN_GAP = 16
 
+logger = init_logger(__name__)
+
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None):
+                 linear_state_pool=None, swa_pool=None, sliding_window_size=None,
+                 host_prefix_cache=None):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -45,6 +48,14 @@ class CacheManager:
         self.sliding_window_size = sliding_window_size
         self.is_hybrid = type == "hybrid_radix"
         self.is_swa = type == "swa_radix"
+        # Host HiCache is only enabled for the plain radix path in this first version.
+        # SWA/GDN/DSV4 restore segments carry a second currency and need dedicated adapters.
+        # Generic host tier is plain dense/radix only. DSV4 uses the dedicated restore
+        # segment tier and remains enabled through the SWA cache manager.
+        self.host_prefix_cache = host_prefix_cache if (
+            type == "radix"
+            or (type == "swa_radix" and getattr(host_prefix_cache, "supports_dsv4", False))
+        ) else None
         # swa_paged: this SWA model drives the global-paged swa pool -- true for BOTH the naive
         # (NaivePrefixCache, no reuse) and radix (SWARadixCache) paths. Gates the swa slot
         # lifecycle (alloc_swa / out-of-window free / free-on-finish). is_swa gates only the extra
@@ -97,13 +108,83 @@ class CacheManager:
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)
-            return MatchResult(SWACacheHandle(m.cached_len, m.node, m.kv_indices))
+            handle = SWACacheHandle(m.cached_len, m.node, m.kv_indices)
+            if self.host_prefix_cache is not None:
+                handle = self._restore_dsv4_host_prefix(req, handle)
+            return MatchResult(handle)
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
             return MatchResult(
                 HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
-        return self.prefix_cache.match_prefix(ids)
+        handle = self.prefix_cache.match_prefix(ids).cuda_handle
+        if self.host_prefix_cache is not None:
+            handle = self._restore_host_prefix(req, handle)
+        return MatchResult(handle)
+
+    def _restore_host_prefix(self, req, handle):
+        """Restore a host/disk-resident continuation after the GPU radix match.
+
+        The restored pages are inserted into the normal GPU radix tree, so the returned
+        handle is indistinguishable from a GPU hit. A partial/failed restore falls back to
+        the original GPU prefix; correctness never depends on the tier.
+        """
+        import torch
+
+        from freetoken.utils import align_down, div_ceil
+
+        host = self.host_prefix_cache
+        ids = req.input_ids[: req.input_len - 1]
+        start = int(handle.cached_len)
+        try:
+            host_len = host.match_len(ids)
+            target = min(host_len, align_down(len(ids), self.page_size))
+            if target <= start:
+                return handle
+            restore_tokens = target - start
+            pages = div_ceil(restore_tokens, self.page_size)
+            # Reserve before locking: available_size includes the handle's evictable pages.
+            needed_tokens = pages * self.page_size
+            if needed_tokens > self.available_size:
+                return handle
+            self.prefix_cache.lock_handle(handle)
+            new_handle = handle
+            new_locs = None
+            try:
+                allocated = self._allocate(pages)
+                new_locs = self._page_to_token(allocated)
+                restored = host.get(ids, new_locs, start=start)
+                if restored < target:
+                    # This can only happen if the host page disappeared under us; the
+                    # pages are still valid and will be published for the restored length.
+                    target = restored
+                gpu_matched = (
+                    handle.get_matched_indices().clone() if start else torch.empty(0, dtype=torch.int32)
+                )
+                full_ids = ids[:target]
+                full_locs = torch.cat((gpu_matched, new_locs[: target - start]))
+                new_handle = self.prefix_cache.insert_prefix(full_ids, full_locs).handle
+                # If the tree already owned part of the suffix, return those canonical
+                # pages and free our restore duplicates.
+                used = set(new_handle.get_matched_indices().tolist())
+                stale = new_locs[: target - start][
+                    [i for i, loc in enumerate(new_locs[: target - start].tolist()) if loc not in used]
+                ]
+                if stale.numel():
+                    self._free(stale)
+                return new_handle
+            except Exception:
+                if new_locs is not None:
+                    self._free(new_locs)
+                raise
+            finally:
+                self.prefix_cache.lock_handle(handle, unlock=True)
+        except Exception as exc:
+            host.stats.restore_failures += 1
+            if not host._warned_restore_failure:
+                logger.warning("host prefix restore failed; falling back to recompute: %r", exc)
+                host._warned_restore_failure = True
+            return handle
 
     @property
     def available_size(self) -> int:
@@ -278,6 +359,95 @@ class CacheManager:
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
+    def prefetch_host_prefix(self, token_ids: torch.Tensor) -> None:
+        """Best-effort async warm of DSV4 host/SSD prefix pages before admission."""
+        host = self.host_prefix_cache
+        if host is None or not getattr(host, "supports_dsv4", False) or len(token_ids) < 2:
+            return
+        try:
+            # match_req excludes the final prompt token; prefetch exactly that range.
+            host.prefetch(token_ids[: len(token_ids) - 1])
+        except Exception as exc:
+            logger.warning("DSV4 host prefix prefetch failed: %r", exc)
+
+    def _restore_dsv4_host_prefix(self, req, handle):
+        """Restore a DSV4 host prefix and publish it through the live SWA radix tree.
+
+        This first version restores the full host-matched prefix (not only the delta after
+        the GPU match). That keeps interaction with SWA tombstone revival simple: every
+        restored page is freshly bound, old pages beyond the sliding window are tombstoned
+        at insert, and the tail page remains live for compressor carry-by-value.
+        """
+        from freetoken.kvcache.swa_radix_cache import SWACacheHandle
+        from freetoken.utils import align_down
+
+        host = self.host_prefix_cache
+        if host is None or not getattr(host, "supports_dsv4", False):
+            return handle
+        ids = req.input_ids[: req.input_len - 1]
+        P = host.page_size
+        try:
+            target = min(host.restorable_len(ids), align_down(len(ids), P))
+            if target <= int(handle.cached_len):
+                return handle
+            pages = target // P
+            needed_tokens = pages * P
+            # Lock the matched prefix before either allocator can reclaim it, then check
+            # capacity so the locked pages are not counted as evictable headroom.
+            self.lock(handle)
+            allocated = full_locs = None
+            published = False
+            try:
+                if needed_tokens > self.available_size:
+                    return handle
+                allocated = self._allocate(pages)
+                order = torch.argsort(allocated)
+                full_locs = self._page_to_token(allocated[order])
+                if self.swa_pool.swa_available_size() < needed_tokens:
+                    self.ensure_swa_slots(needed_tokens)
+                if self.swa_pool.swa_available_size() < needed_tokens:
+                    self._free(full_locs)
+                    allocated = full_locs = None
+                    return handle
+                self.swa_pool.alloc_swa(full_locs)
+                restored = host.get(ids, full_locs)
+                if restored < target:
+                    extra = full_locs[restored:]
+                    if extra.numel():
+                        self.swa_pool.free_swa(extra)
+                        self._free(extra)
+                    target = restored
+                    full_locs = full_locs[:target]
+                # Insert every restored page live, publish the full prefix, then tombstone
+                # the head down to one trailing window. Doing it in this order avoids the
+                # SWA match rule truncating a two-page restore to just its live tail.
+                _, freed = self.prefix_cache.insert(
+                    req.input_ids[:target], full_locs, update_kv_after_len=0,
+                )
+                published = True
+                self._free_swa(freed)
+                self._free(freed)
+                m = self.prefix_cache.match_prefix(req.input_ids[:target])
+                keep_from = align_down(max(0, target - P), P)
+                if keep_from > 0:
+                    self._free_swa(self.prefix_cache.trim_head_swa(
+                        req.input_ids[:target], keep_from
+                    ))
+                return SWACacheHandle(m.cached_len, m.node, m.kv_indices)
+            except Exception:
+                if not published and full_locs is not None:
+                    self.swa_pool.free_swa(full_locs)
+                    self._free(full_locs)
+                raise
+            finally:
+                self.unlock(handle)
+        except Exception as exc:
+            host.stats.restore_failures += 1
+            if not host._warned_restore_failure:
+                logger.warning("DSV4 host prefix restore failed; falling back: %r", exc)
+                host._warned_restore_failure = True
+            return handle
+
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
@@ -323,6 +493,15 @@ class CacheManager:
                     canonical[old_handle.cached_len : cached_len])
             req.cache_handle = new_handle
             self.lock(new_handle)
+            if self.host_prefix_cache is not None:
+                try:
+                    stored_len = int(new_handle.cached_len)
+                    self.host_prefix_cache.put(
+                        insert_ids[:stored_len],
+                        new_handle.get_matched_indices()[:stored_len].clone(),
+                    )
+                except Exception as exc:
+                    logger.warning("host prefix write failed: %r", exc)
 
     def _cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.
@@ -486,6 +665,20 @@ class CacheManager:
                 self.page_table[req.table_idx, : m.cached_len].copy_(m.kv_indices)
             req.cache_handle = SWACacheHandle(m.cached_len, m.node, m.kv_indices)
             self.lock(req.cache_handle)
+        self._put_dsv4_host_prefix(req, insert_len=insert_len)
+
+    def _put_dsv4_host_prefix(self, req: Req, *, insert_len: int) -> None:
+        """Write complete DSV4 pages to the dedicated HiCache tier after SWA commit."""
+        host = self.host_prefix_cache
+        if host is None or not getattr(host, "supports_dsv4", False) or insert_len <= 0:
+            return
+        try:
+            host.put(
+                req.input_ids[:insert_len],
+                self.page_table[req.table_idx, :insert_len].clone(),
+            )
+        except Exception as exc:
+            logger.warning("DSV4 host prefix write failed: %r", exc)
 
     def _padded_tail(self, req: Req, start: int) -> torch.Tensor:
         """The request's OWN slice [start, page_ceil(cached_len)) of the page table. A finish
