@@ -15,7 +15,8 @@ import os
 import struct
 import dataclasses
 import threading
-from collections import OrderedDict
+import time
+from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +42,23 @@ class DSV4PrefixTierStats:
     prefetch_scheduled: int = 0
     prefetch_already_hot: int = 0
     prefetch_failures: int = 0
+    put_ms_total: float = 0.0
+    restore_ms_total: float = 0.0
+    prefetch_ms_total: float = 0.0
+    wait_ms_total: float = 0.0
+
+
+def _timed(name: str):
+    """Record wall latency for a HiCache operation without nesting its locking logic."""
+    def decorator(method):
+        def wrapper(self, *args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                self._record_latency(name, started)
+        return wrapper
+    return decorator
 
 
 class DSV4PrefixTier:
@@ -49,7 +67,8 @@ class DSV4PrefixTier:
     supports_dsv4 = True
 
     def __init__(self, pool, *, page_size: int, capacity_pages: int,
-                 disk_dir: str | Path | None = None) -> None:
+                 disk_dir: str | Path | None = None,
+                 disk_capacity_pages: int | None = None) -> None:
         from .dsv4_paged_pool import DSV4PagedKVCache
 
         if not isinstance(pool, DSV4PagedKVCache):
@@ -60,6 +79,9 @@ class DSV4PrefixTier:
         self.page_size = int(page_size)
         self.capacity_pages = max(1, int(capacity_pages))
         self.disk_dir = Path(disk_dir).resolve() if disk_dir is not None else None
+        self.disk_capacity_pages = (
+            max(1, int(disk_capacity_pages)) if disk_capacity_pages is not None else None
+        )
         if self.disk_dir is not None:
             self.disk_dir.mkdir(parents=True, exist_ok=True)
         self.index = RadixPrefixCache(torch.device("cpu"), page_size=self.page_size)
@@ -70,6 +92,9 @@ class DSV4PrefixTier:
         self.free_page_ids: list[int] = []
         self.next_page_id = 0
         self.stats = DSV4PrefixTierStats()
+        self._latency_samples: dict[str, deque[float]] = {
+            name: deque(maxlen=256) for name in ("put", "restore", "prefetch", "wait")
+        }
         self._warned_restore_failure = False
         self._disk_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dsv4-prefix-tier")
         self._disk_writes: dict[int, Future] = {}
@@ -107,13 +132,54 @@ class DSV4PrefixTier:
         return int(n)
 
     def stats_snapshot(self) -> dict:
+        bytes_per_page = self.bytes_per_page()
+        put_p50, put_p95 = self._percentiles("put")
+        restore_p50, restore_p95 = self._percentiles("restore")
+        prefetch_p50, prefetch_p95 = self._percentiles("prefetch")
+        wait_p50, wait_p95 = self._percentiles("wait")
         return {
             **dataclasses.asdict(self.stats),
+            "put_ms_p50": round(put_p50, 3),
+            "put_ms_p95": round(put_p95, 3),
+            "restore_ms_p50": round(restore_p50, 3),
+            "restore_ms_p95": round(restore_p95, 3),
+            "prefetch_ms_p50": round(prefetch_p50, 3),
+            "prefetch_ms_p95": round(prefetch_p95, 3),
+            "wait_ms_p50": round(wait_p50, 3),
+            "wait_ms_p95": round(wait_p95, 3),
+            "disk_read_bytes": self.stats.disk_reads * bytes_per_page,
+            "disk_write_bytes": self.stats.disk_writes * bytes_per_page,
+            "host_bytes": len(self.host_pages) * bytes_per_page,
+            "disk_bytes": len(self.disk_pages) * bytes_per_page,
             "cached_pages": self.index.size_info.total_size // self.page_size,
             "host_pages": len(self.host_pages),
             "disk_pages": len(self.disk_pages),
             "capacity_pages": self.capacity_pages,
+            "disk_capacity_pages": self.disk_capacity_pages,
         }
+
+    def _record_latency(self, name: str, started: float) -> None:
+        if name not in self._latency_samples:
+            name = {"get": "restore", "wait_prefetch": "wait"}.get(name, name)
+        ms = max(0.0, (time.perf_counter() - started) * 1000.0)
+        self._latency_samples[name].append(ms)
+        if name == "put":
+            self.stats.put_ms_total += ms
+        elif name == "restore":
+            self.stats.restore_ms_total += ms
+        elif name == "prefetch":
+            self.stats.prefetch_ms_total += ms
+        elif name == "wait":
+            self.stats.wait_ms_total += ms
+
+    def _percentiles(self, name: str) -> tuple[float, float]:
+        values = sorted(self._latency_samples[name])
+        if not values:
+            return 0.0, 0.0
+        def pct(percent: float) -> float:
+            index = min(len(values) - 1, max(0, round((len(values) - 1) * percent)))
+            return values[index]
+        return pct(0.50), pct(0.95)
 
     def match_len(self, token_ids: torch.Tensor) -> int:
         return int(self.index.match_prefix(self._cpu(token_ids)).cuda_handle.cached_len)
@@ -142,6 +208,7 @@ class DSV4PrefixTier:
         finally:
             self.index.lock_handle(handle, unlock=True)
 
+    @_timed("prefetch")
     def prefetch(self, token_ids: torch.Tensor) -> int:
         """Warm disk-resident prefix pages into host RAM before admission.
 
@@ -177,6 +244,7 @@ class DSV4PrefixTier:
             finally:
                 self.index.lock_handle(handle, unlock=True)
 
+    @_timed("wait_prefetch")
     def wait_prefetch(self, token_ids: torch.Tensor | None = None) -> None:
         """Wait for prefetches along a prefix (or all pending prefetches when None)."""
         with self._lock:
@@ -199,6 +267,7 @@ class DSV4PrefixTier:
         for future in futures:
             future.result()
 
+    @_timed("put")
     def put(self, token_ids: torch.Tensor, full_locs: torch.Tensor) -> int:
         ids = self._cpu(token_ids)
         aligned = align_down(len(ids), self.page_size)
@@ -251,6 +320,7 @@ class DSV4PrefixTier:
             finally:
                 self.index.lock_handle(handle, unlock=True)
 
+    @_timed("get")
     def get(self, token_ids: torch.Tensor, full_locs: torch.Tensor) -> int:
         """Restore all complete host/disk pages into freshly bound full/window pages."""
         ids = self._cpu(token_ids)
@@ -460,6 +530,18 @@ class DSV4PrefixTier:
                 self.next_page_id += 1
         return page_ids
 
+    def _ensure_disk_capacity(self, extra_pages: int) -> None:
+        """Make room in the SSD tier by evicting radix LRU leaves. Raises when full."""
+        if self.disk_capacity_pages is None:
+            return
+        while len(self.disk_pages) + extra_pages > self.disk_capacity_pages:
+            evicted = self.evict(1)
+            if evicted == 0:
+                raise RuntimeError(
+                    f"DSV4 HiCache disk tier is full ({len(self.disk_pages)}/"
+                    f"{self.disk_capacity_pages} pages) and has no evictable prefix"
+                )
+
     def _ensure_host_capacity(self, extra_pages: int) -> None:
         while len(self.host_pages) + extra_pages > self.capacity_pages:
             if not self.host_pages:
@@ -468,6 +550,7 @@ class DSV4PrefixTier:
                 raise RuntimeError(
                     "DSV4 host prefix tier is full; set --host-prefix-cache-dir to spill"
                 )
+            self._ensure_disk_capacity(extra_pages)
             page_id, payload = self.host_pages.popitem(last=False)
             path = self.disk_dir / f"page-{page_id:016x}.pt"
             self.disk_pages[page_id] = path
@@ -572,16 +655,22 @@ def _checksum_payload(payload) -> str:
 
 
 def create_dsv4_prefix_tier(pool, *, capacity_gib: float,
-                            disk_dir: str | None = None) -> DSV4PrefixTier | None:
-    """Create a DSV4 tier from a host RAM budget. Page byte size is exact for the pool."""
+                            disk_dir: str | None = None,
+                            disk_capacity_gib: float = 0.0) -> DSV4PrefixTier | None:
+    """Create a DSV4 tier from host/SSD budgets. Page byte size is exact for the pool."""
     if capacity_gib <= 0:
         return None
     probe = DSV4PrefixTier(
         pool, page_size=pool.P, capacity_pages=1, disk_dir=disk_dir
     )
+    bytes_per_page = probe.bytes_per_page()
     probe.capacity_pages = max(
-        1, int(float(capacity_gib) * (1 << 30) // max(1, probe.bytes_per_page()))
+        1, int(float(capacity_gib) * (1 << 30) // max(1, bytes_per_page))
     )
+    if disk_dir is not None and disk_capacity_gib > 0:
+        probe.disk_capacity_pages = max(
+            1, int(float(disk_capacity_gib) * (1 << 30) // max(1, bytes_per_page))
+        )
     return probe
 
 

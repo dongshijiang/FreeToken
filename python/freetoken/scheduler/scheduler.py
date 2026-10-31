@@ -7,6 +7,19 @@ from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAl
 import torch
 from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req
+
+# Diagnostic decode profiler (FREETOKEN_PROFILE_DECODE="wait,active,min_bs", e.g. "200,30,6"):
+# after `wait` qualifying decode steps, records `active` steps (bs >= min_bs) with
+# torch.profiler (CUPTI) and exports a chrome trace to /tmp/decode_trace_r{RANK}.json.
+# Inert in production.
+_SCHED_PROFILE = os.environ.get("FREETOKEN_PROFILE_DECODE", "")
+
+# P1b capacity-wall relief: cap the OUTPUT tokens admission reserves per request
+# (FREETOKEN_KV_OUTPUT_RESERVE, tokens; unset/0 = reserve the full max_tokens, the
+# exact-invariant default). With a cap, admission overcommits output-KV so more
+# requests fit the pool concurrently; growth past the cap is backstopped by
+# _gate_decode_batch. Inert in production.
+_KV_OUTPUT_RESERVE = int(os.environ.get("FREETOKEN_KV_OUTPUT_RESERVE", "0") or 0)
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
 from freetoken.message import (
@@ -21,6 +34,7 @@ from freetoken.message import (
     PromptAdmittedMsg,
     UserMsg,
 )
+from pathlib import Path
 from freetoken.utils import (
     init_logger,
     load_eos_token_ids,
@@ -89,6 +103,7 @@ class Scheduler(SchedulerIOMixin):
                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
+            host_prefix_cache=self._create_host_prefix_cache(config),
         )
         self.decode_manager = DecodeManager(config.page_size)
         self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
@@ -150,6 +165,48 @@ class Scheduler(SchedulerIOMixin):
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
+
+        # Diagnostic decode profiler (FREETOKEN_PROFILE_DECODE="wait,active,min_bs").
+        # The profiler context stays entered for the process lifetime; its schedule
+        # discards samples until `wait` qualifying decode steps have stepped past,
+        # records `active` of them, exports once (on_trace_ready) and then goes quiet.
+        self._prof = None
+        self._prof_min_bs = 0
+        if _SCHED_PROFILE:
+            from torch.profiler import ProfilerActivity, profile
+
+            wait, active, min_bs = (int(x) for x in _SCHED_PROFILE.split(","))
+            rank = os.environ.get("RANK", "0")
+            # Both TP ranks race the same name without RANK in the env (Kineto's
+            # .tmp -> final rename then fails under the second writer), so disambiguate.
+            path = f"/tmp/decode_trace_r{rank}_{os.getpid()}.json"
+
+            def _export(tr, path=path):
+                tr.export_chrome_trace(path)
+                logger.info_rank0(f"decode profile exported: {path}")
+
+            self._prof_min_bs = min_bs
+            # FREETOKEN_PROFILE_STACKS=1: record_shapes + with_stack — decodes-only and
+            # eager mode only make sense (in CUDA graphs the kernels have no per-launch
+            # cpu_op parent, so attribution must happen at eager launch time). Slows the
+            # profiled steps; never use for timing, only for op->code attribution.
+            _stacks = os.environ.get("FREETOKEN_PROFILE_STACKS", "0") == "1"
+            self._prof = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=torch.profiler.schedule(wait=wait, warmup=2, active=active, repeat=1),
+                on_trace_ready=_export,
+                record_shapes=_stacks,
+                with_stack=_stacks,
+            )
+            self._prof.__enter__()
+
+    def _prof_step_maybe(self, data: ForwardData | None) -> None:
+        """One profiler schedule step per qualifying decode forward (see _SCHED_PROFILE)."""
+        if data is None or self._prof is None:
+            return
+        batch = data[0].batch
+        if batch.is_decode and batch.size >= self._prof_min_bs:
+            self._prof.step()
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
@@ -303,8 +360,17 @@ class Scheduler(SchedulerIOMixin):
             data = None
             while True:
                 data = self.overlap_loop(data)
+                self._prof_step_maybe(data)
 
     def shutdown(self) -> None:
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
+        if self.cache_manager.host_prefix_cache is not None:
+            try:
+                self.cache_manager.host_prefix_cache.close()
+            except Exception as exc:
+                logger.warning("failed to close host prefix cache: %r", exc)
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
@@ -415,6 +481,13 @@ class Scheduler(SchedulerIOMixin):
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
                 m.gpu_mem_bytes = mem
+                if self.cache_manager.host_prefix_cache is not None:
+                    try:
+                        m.hicache = self.cache_manager.host_prefix_cache.stats_snapshot()
+                    except Exception as exc:
+                        logger.warning("could not snapshot host prefix cache: %r", exc)
+        engine = getattr(self, "engine", None)
+        moe_cache = getattr(engine, "moe_offload_cache", None)
         self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),
@@ -424,8 +497,29 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
+            moe_stats=self._moe_status if moe_cache is not None and moe_cache.collect_stats else None,
         )
         self.send_result(reply)
+
+    def _moe_status(self) -> str:
+        """One throttled decode-log line of expert cache behavior. The stats read does a
+        small device sync, but only when the reporter is about to emit a status line."""
+        cache = self.engine.moe_offload_cache
+        if cache is None or not cache.collect_stats:
+            return ""
+        stats = cache.decode_miss_stats()
+        parts = [
+            f"moe-miss-rate: {stats['miss_rate']:.3f}",
+            f"moe-active/layer: {stats['active_per_layer']:.2f}",
+            f"moe-missing/layer: {stats['missing_per_layer']:.2f}",
+        ]
+        if cache.decode_target == "hybrid":
+            parts.extend([
+                f"moe-fetch/layer: {stats['fetched_per_layer']:.2f}",
+                f"moe-cpu/layer: {stats['cpu_per_layer']:.2f}",
+                f"moe-fetch-rate: {stats['fetch_rate']:.3f}",
+            ])
+        return ", ".join(parts)
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -483,6 +577,32 @@ class Scheduler(SchedulerIOMixin):
         if self.device.type != "cuda":
             return 0
         return torch.cuda.memory_reserved(self.device)
+
+    def _create_host_prefix_cache(self, config):
+        """Build the host/SSD HiCache tier appropriate for the pool family."""
+        if not config.enable_host_prefix_cache:
+            return None
+        from freetoken.kvcache.dsv4_prefix_tier import create_dsv4_prefix_tier
+        from freetoken.kvcache.prefix_tier import create_host_prefix_tier
+
+        pool = self.engine.kv_cache
+        disk_dir = config.host_prefix_cache_dir
+        if disk_dir is not None:
+            # Each TP rank owns an independent host tier; keep sidecars from colliding.
+            disk_dir = str(Path(disk_dir) / f"tp-{config.tp_info.rank}")
+        if getattr(config.model_config, "dsv4_args", None) is not None:
+            return create_dsv4_prefix_tier(
+                pool,
+                capacity_gib=config.host_prefix_cache_gib,
+                disk_dir=disk_dir,
+                disk_capacity_gib=config.host_prefix_cache_disk_gib,
+            )
+        return create_host_prefix_tier(
+            pool,
+            page_size=config.page_size,
+            capacity_gib=config.host_prefix_cache_gib,
+            disk_dir=disk_dir,
+        )
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
@@ -872,11 +992,80 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
         )
+        if batch is not None and batch.is_decode:
+            batch = self._gate_decode_batch(batch)
         if batch is None:
             return None
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
+
+    def _gate_decode_batch(self, batch: Batch) -> Batch | None:
+        """Overcommit backstop for FREETOKEN_KV_OUTPUT_RESERVE (prefill._KV_OUTPUT_RESERVE).
+
+        With full output reservation the admission invariant -- available_size >= sum of
+        running remain_len -- is exact (each generated token consumes one token of pool and
+        one of remain_len in lockstep), so decode can never fail allocation. Capping the
+        reserved output breaks that exactness; when the pool runs short this gate runs the
+        requests still within their reserved budget and pauses the rest (their KV stays
+        mapped, they simply don't grow this step and resume as finishers free pages). Only
+        reqs whose next token crosses a page boundary allocate, so non-crossing reqs always
+        run. If nothing can grow at all, abort the request with the least generated output
+        (least work lost; the client-abort path frees its pages at the next drain and its
+        error ack is the terminal reply) -- the alternative is the pool allocator's
+        "Eviction did not free enough space" assert. Never fires with the reserve unset."""
+        if _KV_OUTPUT_RESERVE <= 0:
+            return batch
+        cm = self.cache_manager
+        # A decode token lands at index device_len: it needs a fresh page iff that crosses
+        # the page boundary (allocate_paged: ceil(dev_len/P) > ceil((dev_len-1)/P)).
+        crossing = [r for r in batch.reqs if r.device_len % cm.page_size == 0]
+        if not crossing:
+            return batch
+        need = len(crossing) * cm.page_size
+        if cm.available_size >= need:
+            return batch
+
+        def generated(req: Req) -> int:
+            return req.output_len - req.remain_len
+
+        # Keep within-budget reqs first, then the ones closest to finishing (they free
+        # pages soonest for the paused reqs to resume).
+        ordered = sorted(
+            crossing, key=lambda r: (generated(r) >= _KV_OUTPUT_RESERVE, -generated(r))
+        )
+        keep = []
+        while ordered and (len(keep) + 1) * cm.page_size <= cm.available_size:
+            keep.append(ordered.pop(0))
+        runners = [r for r in batch.reqs if r not in crossing] + keep
+        if not runners:
+            victim = min(crossing, key=generated)
+            logger.warning_rank0(
+                "KV pool exhausted with all %d decode reqs past their reserved output "
+                "(FREETOKEN_KV_OUTPUT_RESERVE=%d): aborting req %d",
+                len(batch.reqs), _KV_OUTPUT_RESERVE, victim.uid,
+            )
+            self.decode_manager.abort_req(victim.uid)
+            if victim.mm_items and self.engine.encoder_cache is not None:
+                self.engine.encoder_cache.release(
+                    victim.uid, [item.hash for item in victim.mm_items]
+                )
+            inflight = self._last_data is not None and victim in self._last_data[0].batch.reqs
+            if inflight:
+                victim.aborted = True
+            else:
+                self._free_req_resources(victim)
+            self._pending_abort_acks.add(victim.uid)
+            return None
+        if len(runners) == len(batch.reqs):
+            return batch
+        paused = sorted(r.uid for r in batch.reqs if r not in runners)
+        logger.warning_rank0(
+            "KV pool short (avail %d < %d needed): pausing decode reqs %s past their "
+            "reserved output until finishers free pages",
+            cm.available_size, need, paused,
+        )
+        return Batch(reqs=sorted(runners, key=lambda r: r.uid), phase="decode")
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
         """Publish first-prefill accounting only after batch preparation succeeded.

@@ -89,6 +89,11 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # HiCache-style host/disk prefix tier (plain dense/radix models in the first version).
+    enable_host_prefix_cache: bool = False
+    host_prefix_cache_gib: float = 16.0
+    host_prefix_cache_dir: str | None = None
+    host_prefix_cache_disk_gib: float = 0.0
     # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
