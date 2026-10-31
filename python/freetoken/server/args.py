@@ -776,6 +776,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        dest="moe_collect_stats",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Collect graph-safe MoE decode miss-rate counters. Useful when tuning "
+            "expert cache size and hybrid fetch behavior."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-prefill-hit-d2d",
         action="store_true",
         dest="moe_prefill_hit_d2d",
@@ -785,6 +796,42 @@ def parse_args(
             "the double buffer and stream only the misses over PCIe "
             "(cudaMemcpyBatchAsync, CUDA >= 13.0). Effective with "
             "--moe-cache-size > 2 * num_experts."
+        ),
+    )
+
+    parser.add_argument(
+        "--enable-host-prefix-cache",
+        action="store_true",
+        dest="enable_host_prefix_cache",
+        default=ServerArgs.enable_host_prefix_cache,
+        help=(
+            "Enable the HiCache-style host/disk prefix tier for plain dense/radix models. "
+            "Cold GPU prefix pages are copied to host RAM and can spill to disk."
+        ),
+    )
+    parser.add_argument(
+        "--host-prefix-cache-gib",
+        type=float,
+        default=ServerArgs.host_prefix_cache_gib,
+        help="Host RAM budget for the prefix tier in GiB.",
+    )
+    parser.add_argument(
+        "--host-prefix-cache-disk-gib",
+        type=float,
+        default=ServerArgs.host_prefix_cache_disk_gib,
+        help=(
+            "SSD budget for the DSV4 prefix tier in GiB. 0 (default) means unlimited. "
+            "When full, the lowest-value complete prefix is evicted."
+        ),
+    )
+
+    parser.add_argument(
+        "--host-prefix-cache-dir",
+        type=str,
+        default=ServerArgs.host_prefix_cache_dir,
+        help=(
+            "Directory for spilled host prefix pages. Required when the prefix set exceeds "
+            "--host-prefix-cache-gib; omitted means host-only."
         ),
     )
 
