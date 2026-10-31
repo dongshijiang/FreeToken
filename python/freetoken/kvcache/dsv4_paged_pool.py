@@ -152,6 +152,8 @@ class CompressStateRing:
 
 
 class DSV4PagedKVCache(BaseKVCachePool):
+    # DSV4 has a dedicated restore-segment adapter; the generic per-token tier does not apply.
+    supports_prefix_tier: bool = False
     def __init__(
         self,
         sizes: DSV4PoolSizes,
@@ -585,6 +587,105 @@ class DSV4PagedKVCache(BaseKVCachePool):
             if r is not None
         )
         return int(n)
+
+    # ----- HiCache restore segments -----
+    # One payload is enough to resume a page-aligned prefix: window KV, all compressed
+    # KV/indexer KV blocks in the page, and both compressor carry blocks for that page.
+    # A page whose window slot was already tombstoned stores None for window KV; restore
+    # zero-fills it and the SWA radix tombstones it again after insertion.
+
+    def gather_prefix_page(self, full_locs: torch.Tensor) -> dict:
+        P = self.P
+        fi = full_locs.detach().to(device=self._device, dtype=torch.int64)
+        assert fi.numel() == P
+        base = int(fi[0].item())
+        assert bool(torch.equal(fi, base + torch.arange(P, device=self._device))), (
+            "DSV4 HiCache pages must be contiguous full-token pages"
+        )
+        window_slot = int(self.full_to_window[base].item())
+        window = None
+        if window_slot >= 0:
+            assert window_slot % P == 0
+            window = [
+                self.window_pool[layer_id][window_slot:window_slot + P].detach().cpu().clone()
+                for layer_id in range(self._n_layers)
+            ]
+
+        cmp: dict[int, torch.Tensor] = {}
+        idx: dict[int, torch.Tensor] = {}
+        rings: dict[int, dict[str, torch.Tensor | None]] = {}
+        for layer_id, ratio in enumerate(self.compress_ratios):
+            if not ratio:
+                continue
+            # One compressed row per block, not one per token position.
+            cmp_rows = torch.arange(
+                base // ratio, (base + P) // ratio, device=self._device, dtype=torch.int64
+            )
+            cmp[layer_id] = self.cmp_pool[layer_id][cmp_rows].detach().cpu().clone()
+            if ratio == 4:
+                idx[layer_id] = self.idx_pool[layer_id][cmp_rows].detach().cpu().clone()
+            rings[layer_id] = {}
+            for tier, attr in (("attn", "state_ring"), ("idx", "indexer_state_ring")):
+                ring = getattr(self, attr)[layer_id]
+                if ring is None:
+                    rings[layer_id][tier] = None
+                    continue
+                ring_page = window_slot // P if window_slot >= 0 else None
+                if ring_page is None:
+                    rings[layer_id][tier] = None
+                else:
+                    block_base = ring_page * ring.ring_size
+                    rings[layer_id][tier] = (
+                        ring.buffer[block_base:block_base + ring.ring_size]
+                        .detach().cpu().clone()
+                    )
+        return {"window": window, "cmp": cmp, "idx": idx, "rings": rings}
+
+    def scatter_prefix_page(self, full_locs: torch.Tensor, payload: dict) -> None:
+        P = self.P
+        fi = full_locs.detach().to(device=self._device, dtype=torch.int64)
+        base = int(fi[0].item())
+        assert bool(torch.equal(fi, base + torch.arange(P, device=self._device))), (
+            "DSV4 HiCache restore pages must be contiguous full-token pages"
+        )
+        assert self.full_to_window[base].item() >= 0, "restore page is not bound to a window page"
+        window_slot = int(self.full_to_window[base].item())
+        assert window_slot % P == 0
+
+        window = payload.get("window")
+        for layer_id in range(self._n_layers):
+            if window is not None:
+                self.window_pool[layer_id][window_slot:window_slot + P].copy_(
+                    window[layer_id].to(device=self._device, dtype=self._dtype)
+                )
+            else:
+                self.window_pool[layer_id][window_slot:window_slot + P].zero_()
+
+        for layer_id, ratio in enumerate(self.compress_ratios):
+            if not ratio:
+                continue
+            rows = torch.arange(
+                base // ratio, (base + P) // ratio, device=self._device, dtype=torch.int64
+            )
+            self.cmp_pool[layer_id][rows] = payload["cmp"][layer_id].to(
+                device=self._device, dtype=self.cmp_pool[layer_id].dtype
+            )
+            if ratio == 4:
+                self.idx_pool[layer_id][rows] = payload["idx"][layer_id].to(
+                    device=self._device, dtype=self.idx_pool[layer_id].dtype
+                )
+            rings = payload["rings"].get(layer_id, {})
+            for tier, attr in (("attn", "state_ring"), ("idx", "indexer_state_ring")):
+                ring = getattr(self, attr)[layer_id]
+                block = rings.get(tier)
+                if ring is None or block is None:
+                    continue
+                ring_page = window_slot // P
+                block_base = ring_page * ring.ring_size
+                ring.buffer[block_base:block_base + ring.ring_size] = block.to(
+                    device=self._device, dtype=ring.buffer.dtype
+                )
+                ring._clear_scratch()
 
     # ----- BaseKVCachePool interface -----
     def k_cache(self, index: int) -> torch.Tensor:
