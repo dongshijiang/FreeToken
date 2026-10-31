@@ -25,6 +25,8 @@ from .mha_pool import MHAKVCache
 
 
 class BSAKVCache(MHAKVCache):
+    # The first host prefix tier exports only MHA K/V; sparse index tiers need adapters.
+    supports_prefix_tier: ClassVar[bool] = False
     """MHA paged pool + the block-sparse index-key slab.
 
     ``index_k_cache(slot)`` is row-flat ``[num_pages * page_size,

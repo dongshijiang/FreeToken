@@ -10,6 +10,14 @@ from freetoken.utils import div_even, init_logger, mem_GB
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class PrefixTierSlab:
+    """One per-token host-tier slab (token dimensions only, token count excluded)."""
+    name: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+
 class CacheRebuildRejected(Exception):
     """A runtime cache rebuild was rejected BEFORE any destructive free (e.g. the
     requested geometry does not fit). The old caches are intact and serving continues --
@@ -44,6 +52,9 @@ class BaseKVCachePool(ABC):
     # Pools whose buffers are bound into per-forward model scratch (DSV4's tiers) need the
     # model re-bound after a rebuild; the engine asks before it resizes.
     needs_rebind_on_rebuild: ClassVar[bool] = False
+    # Only pools that can export/import every state needed to resume a page-aligned prefix
+    # may opt in. DSV4/GDN/SWA variants need a pool-specific restore-segment adapter.
+    supports_prefix_tier: ClassVar[bool] = False
 
     # ---- sizing/cost classmethods: run BEFORE the pool exists (startup budget solve,
     # --moe-cache-auto). The engine measures memory and passes bytes in; each pool family

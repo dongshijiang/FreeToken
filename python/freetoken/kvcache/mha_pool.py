@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from typing import Sequence
+from typing import ClassVar, Sequence
 
 import torch
 from freetoken.distributed import get_tp_info
 from freetoken.utils import div_even
 
-from .base import BaseKVCachePool
+from .base import BaseKVCachePool, PrefixTierSlab
 
 
 class MHAKVCache(BaseKVCachePool):
+    supports_prefix_tier: ClassVar[bool] = True
     """
     Base class for key-value caches.
     This class defines the interface for key-value caches used in LLMs.
@@ -116,6 +117,45 @@ class MHAKVCache(BaseKVCachePool):
 
     def v_cache(self, index: int) -> torch.Tensor:
         return self._v_buffer[self._dense(index)]
+
+    def _prefix_storage_layers(self) -> list[int]:
+        if self._layer_map is None:
+            return list(range(self._num_layers))
+        return [global_id for global_id, dense in enumerate(self._layer_map) if dense >= 0]
+
+    def prefix_tier_slabs(self) -> tuple:
+        slabs = []
+        for global_id in self._prefix_storage_layers():
+            dense = self._dense(global_id)
+            shape = self._kv_buffer[dense].shape[3:]
+            slabs.append(PrefixTierSlab(f"layer-{global_id}-k", shape, self._kv_buffer.dtype))
+            slabs.append(PrefixTierSlab(f"layer-{global_id}-v", shape, self._kv_buffer.dtype))
+        return tuple(slabs)
+
+    def gather_prefix_tier(self, locs: torch.Tensor, *, pin: bool = False) -> list[torch.Tensor]:
+        locs = locs.detach().cpu().to(torch.int64)
+        out: list[torch.Tensor] = []
+        for global_id in self._prefix_storage_layers():
+            dense = self._dense(global_id)
+            shape = self._kv_buffer[dense].shape[3:]
+            for buffer in (self._k_buffer[dense], self._v_buffer[dense]):
+                slab = torch.empty((len(locs), *shape), dtype=buffer.dtype, pin_memory=pin)
+                slab.copy_(buffer.view(self._storage_shape)[locs])
+                out.append(slab)
+        return out
+
+    def scatter_prefix_tier(self, locs: torch.Tensor, slabs: list[torch.Tensor]) -> None:
+        locs = locs.detach().cpu().to(torch.int64)
+        cursor = 0
+        for global_id in self._prefix_storage_layers():
+            dense = self._dense(global_id)
+            for buffer in (self._k_buffer[dense], self._v_buffer[dense]):
+                buffer.view(self._storage_shape)[locs] = slabs[cursor].to(
+                    device=buffer.device, dtype=buffer.dtype
+                )
+                cursor += 1
+        if cursor != len(slabs):
+            raise ValueError(f"expected {cursor} prefix slabs, got {len(slabs)}")
 
     def store_kv(
         self,

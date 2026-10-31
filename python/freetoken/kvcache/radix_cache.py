@@ -114,6 +114,8 @@ class RadixCacheHandle(BaseCacheHandle):
     node: RadixTreeNode
 
     def get_matched_indices(self) -> torch.Tensor:
+        if self.cached_len == 0 or self.node.is_root():
+            return torch.empty(0, dtype=torch.int32, device=self.node.device if hasattr(self.node, "device") else None)
         node = self.node
         value_list: List[torch.Tensor] = []
         while not node.is_root():
