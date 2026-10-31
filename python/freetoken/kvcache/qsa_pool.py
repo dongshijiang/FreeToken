@@ -36,6 +36,8 @@ _ROPE_POS_BYTES = 3 * 4
 
 
 class QSAKVCache(MHAKVCache):
+    # The first host prefix tier exports only MHA K/V; sparse index tiers need adapters.
+    supports_prefix_tier: ClassVar[bool] = False
     """MHA paged pool + the compressed index-key slab + the per-request pending ring.
 
     ``cmp_k_cache(slot)`` is row-flat ``[num_pages * page_size // index_ratio + num_req_slots,

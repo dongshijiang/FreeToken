@@ -18,12 +18,15 @@ bytes off the attention-group spec) stay correct by construction.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import torch
 
-from .base import BaseKVCachePool
+from .base import BaseKVCachePool, PrefixTierSlab
 
 
 class MLAKVCache(BaseKVCachePool):
+    supports_prefix_tier: ClassVar[bool] = True
     """Paged latent-KV pool: ``[1, num_layers, num_pages, page_size, 1, latent_dim]``.
 
     The leading singleton keeps the buffer shape-compatible with MHAKVCache's
@@ -100,6 +103,36 @@ class MLAKVCache(BaseKVCachePool):
         split = rows.shape[1] - k_rope.shape[-1]
         rows[out_loc, :split] = c_kv
         rows[out_loc, split:] = k_rope
+
+    def _prefix_global_layers(self) -> list[int]:
+        if self._layer_index is None:
+            return list(range(self._num_layers))
+        return sorted(self._layer_index)
+
+    def prefix_tier_slabs(self) -> tuple:
+        return tuple(
+            PrefixTierSlab(f"layer-{layer_id}-latent", (self._latent_dim,), self._dtype)
+            for layer_id in self._prefix_global_layers()
+        )
+
+    def gather_prefix_tier(self, locs: torch.Tensor, *, pin: bool = False) -> list[torch.Tensor]:
+        locs = locs.detach().cpu().to(torch.int64)
+        out = []
+        for layer_id in self._prefix_global_layers():
+            rows = self.latent_rows(layer_id)[locs]
+            slab = torch.empty_like(rows, pin_memory=pin)
+            slab.copy_(rows)
+            out.append(slab)
+        return out
+
+    def scatter_prefix_tier(self, locs: torch.Tensor, slabs: list[torch.Tensor]) -> None:
+        locs = locs.detach().cpu().to(torch.int64)
+        if len(slabs) != len(self._prefix_global_layers()):
+            raise ValueError("prefix slab count does not match pool layers")
+        for layer_id, slab in zip(self._prefix_global_layers(), slabs):
+            self.latent_rows(layer_id)[locs] = slab.to(
+                device=self._device, dtype=self._dtype
+            )
 
     def rebuild(self, num_pages: int) -> None:
         """In-place resize (frees the old slab first; object identity preserved --
@@ -185,6 +218,33 @@ class DSAKVCache(MLAKVCache):
             device=self._device,
         )
 
+    def prefix_tier_slabs(self) -> tuple:
+        return super().prefix_tier_slabs() + tuple(
+            PrefixTierSlab(f"index-layer-{slot}", (self._index_head_dim,), torch.bfloat16)
+            for slot in range(self._num_index_layers)
+        )
+
+    def gather_prefix_tier(self, locs: torch.Tensor, *, pin: bool = False) -> list[torch.Tensor]:
+        slabs = super().gather_prefix_tier(locs, pin=pin)
+        locs = locs.detach().cpu().to(torch.int64)
+        for slot in range(self._num_index_layers):
+            rows = self.index_k_cache(slot)[locs]
+            slab = torch.empty_like(rows, pin_memory=pin)
+            slab.copy_(rows)
+            slabs.append(slab)
+        return slabs
+
+    def scatter_prefix_tier(self, locs: torch.Tensor, slabs: list[torch.Tensor]) -> None:
+        latent_count = len(self._prefix_global_layers())
+        if len(slabs) != latent_count + self._num_index_layers:
+            raise ValueError("prefix slab count does not match latent + index layers")
+        super().scatter_prefix_tier(locs, slabs[:latent_count])
+        locs = locs.detach().cpu().to(torch.int64)
+        for slot, slab in enumerate(slabs[latent_count:]):
+            self.index_k_cache(slot)[locs] = slab.to(
+                device=self._device, dtype=torch.bfloat16
+            )
+
     def rebuild(self, num_pages: int) -> None:
         self._index_k_buffer = None
         super().rebuild(num_pages)
@@ -217,6 +277,9 @@ class KpoolDSAKVCache(DSAKVCache):
     forwards; never cleared -- prefix-cache resume points are page-aligned,
     so a stale ring is never read.
     """
+
+    # Restore needs the shadow/ring layout adapter, not the full per-token DSA slab.
+    supports_prefix_tier: ClassVar[bool] = False
 
     def __init__(self, *args, num_req_slots: int, index_ratio: int, **kwargs) -> None:
         self._num_req_slots = num_req_slots
