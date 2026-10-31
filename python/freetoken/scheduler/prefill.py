@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
+import os
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -21,6 +24,45 @@ if TYPE_CHECKING:
     from .table import TableManager
 
 logger = init_logger(__name__)
+
+# Diagnostic admission trace (FREETOKEN_SCHED_TRACE=1): append one jsonl line per
+# scheduling pass that had pending requests, recording who was admitted, who was
+# refused and by which currency (kv_pages / gdn_slots / swa_pool / table / budget).
+# Inert in production. Requires PrefillAdder.last_fail marks in _try_allocate_one.
+_SCHED_TRACE = os.environ.get("FREETOKEN_SCHED_TRACE", "") == "1"
+_trace_fh = None
+
+# P1b capacity-wall relief: admission reserves input + FULL max_tokens of KV upfront,
+# which keeps the exact invariant available_size >= sum(running remain_len) (decode
+# growth never fails) -- but a burst of long-output requests hits the pool wall and
+# queues even when most reserved output never gets generated. Setting
+# FREETOKEN_KV_OUTPUT_RESERVE=N reserves only min(output, N), overcommitting output-KV
+# so more requests fit concurrently; growth past the cap is backstopped by the decode
+# gate in scheduler._gate_decode_batch. 0/unset = exact-invariant default. Inert in
+# production.
+_KV_OUTPUT_RESERVE = int(os.environ.get("FREETOKEN_KV_OUTPUT_RESERVE", "0") or 0)
+
+
+def _trace_schedule(mgr, adder, reqs, failed_uid) -> None:
+    global _trace_fh
+    if _trace_fh is None:
+        rank = os.environ.get("RANK", "x")
+        _trace_fh = open(f"/tmp/sched_trace_r{rank}.jsonl", "a", buffering=1)
+    cm = mgr.cache_manager
+    pool = getattr(cm, "linear_state_pool", None)
+    rec = {
+        "t": round(time.time(), 4),
+        "added": [(r.uid, r.extend_len) for r in reqs],
+        "fail": failed_uid,
+        "budget": adder.pass_budget,
+        "token_budget_left": adder.token_budget,
+        "inflight": adder.reserved_size,
+        "kv_avail": cm.available_size,
+        "swa_avail": getattr(cm, "swa_available_size", None),
+        "gdn_free": pool.num_free_slots if pool is not None else None,
+        "pending": [p.uid for p in mgr.pending_list],
+    }
+    _trace_fh.write(json.dumps(rec) + "\n")
 
 
 def _maybe_pinned(t: torch.Tensor) -> torch.Tensor:
@@ -55,6 +97,8 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
+    # Diagnostic (FREETOKEN_SCHED_TRACE=1): which gate refused the last admission attempt.
+    last_fail: str = ""
 
     def __post_init__(self) -> None:
         if not self.pass_budget:
@@ -69,6 +113,7 @@ class PrefillAdder:
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
+            self.last_fail = "table_exhausted"
             return None
 
         # TODO: consider host cache match case
@@ -77,14 +122,22 @@ class PrefillAdder:
         cached_len = handle.cached_len
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
+        # Output side of the reservation can be capped (FREETOKEN_KV_OUTPUT_RESERVE) to
+        # overcommit and fit more concurrent requests; scheduler._gate_decode_batch
+        # backstops growth past the cap (see _KV_OUTPUT_RESERVE above).
+        reserved_output = req.output_len
+        if _KV_OUTPUT_RESERVE > 0:
+            reserved_output = min(reserved_output, _KV_OUTPUT_RESERVE)
         estimated_size = self._kv_reservation_size(
-            req.input_len + req.output_len, cached_len
+            req.input_len + reserved_output, cached_len
         )
 
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
+            self.last_fail = "kv_pages"
             return None
         self.cache_manager.lock(handle)
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
+            self.last_fail = "kv_pages_locked"
             return self.cache_manager.unlock(handle)
 
         # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
@@ -94,6 +147,7 @@ class PrefillAdder:
             if pool.num_free_slots < 3:
                 self.cache_manager.ensure_mamba_slots(3)
             if pool.num_free_slots < 3:
+                self.last_fail = "gdn_slots"
                 return self.cache_manager.unlock(handle)
 
         # Third currency (SWA): refuse admission unless the swa pool can seat this request's first
@@ -108,6 +162,7 @@ class PrefillAdder:
                 min(max(extend_len, 1), self.cache_manager.sliding_window_size) + 1, ps
             ) * ps
             if self.cache_manager.swa_available_size - self.reserved_swa < need_swa:
+                self.last_fail = "swa_pool"
                 return self.cache_manager.unlock(handle)
 
         table_idx = self.table_manager.allocate()
@@ -172,6 +227,7 @@ class PrefillAdder:
             if 0 < chunk_size < remain_len:
                 aligned = align_down(cached_len + chunk_size, ps) - cached_len
                 if aligned <= 0:
+                    self.last_fail = "chunk_align0"
                     return None
                 chunk_size = aligned
         align = self.cache_manager.prefill_chunk_align
@@ -229,6 +285,7 @@ class PrefillAdder:
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
         if self.token_budget <= 0:
+            self.last_fail = "budget0"
             return None
 
         if chunked_req := pending_req.chunked_req:
@@ -278,6 +335,12 @@ class PrefillManager:
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
+        # Start disk->host HiCache warmup before the request reaches a scheduling pass.
+        try:
+            self.cache_manager.prefetch_host_prefix(req.input_ids)
+        except Exception:
+            # Prefetch must never affect admission correctness.
+            pass
         self.pending_list.append(
             PendingReq(
                 req.uid,
@@ -310,8 +373,10 @@ class PrefillManager:
         # once at admission, so continuation chunks (already-chunked reqs) contribute 0.
         log_new_tokens = 0
         log_cached_tokens = 0
+        failed_uid = None
         for pending_req in self.pending_list:
             is_continuation = pending_req.chunked_req is not None
+            adder.last_fail = ""
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
@@ -335,7 +400,10 @@ class PrefillManager:
                 if not is_continuation:
                     log_cached_tokens += req.cache_handle.cached_len
             else:
+                failed_uid = (pending_req.uid, adder.last_fail or "unknown")
                 break  # We cannot add more requests
+        if _SCHED_TRACE:
+            _trace_schedule(self, adder, reqs, failed_uid)
         if len(reqs) == 0:
             return None
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]

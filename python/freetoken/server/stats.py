@@ -37,6 +37,7 @@ class StatsTracker:
         self.swa_used_tokens = 0
         self.swa_total_tokens = 0
         self.vram_bytes = 0
+        self.hicache: dict[str, int] | None = None
 
     @property
     def active(self) -> int:
@@ -74,6 +75,9 @@ class StatsTracker:
             self.swa_total_tokens = reply.swa_total_tokens
         if getattr(reply, "gpu_mem_bytes", 0) > 0:
             self.vram_bytes = reply.gpu_mem_bytes
+        hicache = getattr(reply, "hicache", None)
+        if hicache is not None:
+            self.hicache = dict(hicache)
         if getattr(reply, "finished", False):
             uid = getattr(reply, "uid", None)
             if uid in self._inflight:
@@ -161,6 +165,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "mamba": mamba,
         "swa": swa,
         "vram_bytes": tr.vram_bytes,
+        "hicache": tr.hicache,
         "gpus": list(getattr(state, "gpus", None) or []),
         "throughput": {
             "decode_tps": round(tr.decode_tps(), 1),

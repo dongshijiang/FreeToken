@@ -88,6 +88,11 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; every value needs an expert format the CPU executor serves (bf16, nvfp4, mxfp4), so fp8 experts cannot use it |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
+| `--moe-collect-stats` | off | Collect graph-safe MoE decode miss-rate counters for cache/fetch tuning |
+| `--enable-host-prefix-cache` | off | HiCache-style host/disk prefix tier; supports plain dense/radix and DSV4 restore segments |
+| `--host-prefix-cache-gib` | 16 | Host RAM budget for the prefix tier |
+| `--host-prefix-cache-dir` | none | Directory for host-tier spill pages; required when the tier exceeds the RAM budget. TP ranks use `tp-<rank>` subdirectories. Admission prefetches disk-resident DSV4 pages, orderly shutdown persists resident pages, and restart rebuilds the index from sidecars |
+| `--host-prefix-cache-disk-gib` | unlimited | SSD budget for the DSV4 prefix tier; when full, the lowest-value complete prefix is evicted |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
 ### API behaviour
