@@ -477,14 +477,24 @@ class CacheManager:
             if keep_from > 0:
                 self.prefix_cache.match_prefix(req.input_ids[:keep_from])
             m = self.prefix_cache.match_prefix(req.input_ids[:insert_len])
-            # Re-point the page table to the tree's live slots for the committed region. Any dup
-            # slots insert reclaimed had their full->swa mapping reset to the 0 sentinel; unlike the
-            # full pool (KV survives in place until realloc), a stale swa mapping would make the
-            # request's subsequent SWA gathers read the sentinel -> corruption. The reconcile revived
-            # the in-window tombstones, so the re-matched slots are live.
-            if m.cached_len > 0:
-                self.page_table[req.table_idx, : m.cached_len].copy_(m.kv_indices)
-            req.cache_handle = SWACacheHandle(m.cached_len, m.node, m.kv_indices)
+            # Adopt the tree's canonical slots for the WHOLE committed span, not just the
+            # windowed-safe prefix (m.cached_len): insert freed this request's own duplicate
+            # pages wherever the tree already held the tokens (kept tombstones, live nodes), so
+            # past the windowed-safe boundary the row would keep pointing at freed pages and
+            # the finish commit would free them a second time. Re-point the tail to the tree's
+            # slots -- their swa below the request's frontier is the 0 sentinel, and the
+            # request's window never reads that far back -- and lock the DEEPEST walked node so
+            # a concurrent revive cannot displace slots the row now references. The fuller
+            # cached_len also floors the swa drivers at the tree-owned span and makes the
+            # finish commit's update_kv_after_len skip every already-inserted node.
+            full_node = m.full_node if m.full_node is not None else m.node
+            full_kv = m.full_kv if m.full_kv is not None else m.kv_indices
+            full_len = int(full_kv.numel())
+            # full_kv[:m.cached_len] IS m.kv_indices (same node values, same order), so one
+            # re-point covers the windowed-safe head and the freed-dup tail alike.
+            if full_len > 0:
+                self.page_table[req.table_idx, :full_len].copy_(full_kv)
+            req.cache_handle = SWACacheHandle(full_len, full_node, full_kv)
             self.lock(req.cache_handle)
 
     def _padded_tail(self, req: Req, start: int) -> torch.Tensor:

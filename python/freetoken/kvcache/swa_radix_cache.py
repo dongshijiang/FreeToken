@@ -56,6 +56,13 @@ class SWAMatch(NamedTuple):
     kv_indices: torch.Tensor   # reused full-pool KV page indices for [0:cached_len) (windowed-safe)
     cached_len: int            # truncated to the windowed-reuse boundary
     node: RadixTreeNode        # the matched windowed-safe node (lock target)
+    # The FULL walked path, windowed-UNSAFE tail included: nodes past the windowed-safe boundary
+    # are swa-tombstoned or hold a sub-window live run. _cache_req_swa re-points the request's
+    # page-table row to these canonical slots for the whole committed span (insert freed the
+    # request's own dup pages there) and locks full_node so a concurrent revive cannot displace
+    # slots the row still references. None on callers that only need the windowed-safe view.
+    full_node: Optional[RadixTreeNode] = None
+    full_kv: Optional[torch.Tensor] = None
 
 
 class SWAEvictResult(NamedTuple):
@@ -132,7 +139,8 @@ class SWARadixCache:
 
         self._stamp_path(best_node)
         kv = torch.cat(value[:best_value_len]) if best_value_len else self.empty
-        return SWAMatch(kv, int(kv.numel()), best_node)
+        full_kv = torch.cat(value) if value else self.empty
+        return SWAMatch(kv, int(kv.numel()), best_node, node, full_kv)
 
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
                swa_evicted_seqlen: int = 0, update_kv_after_len: int = 0

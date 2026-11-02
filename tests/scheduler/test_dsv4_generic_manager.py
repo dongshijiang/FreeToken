@@ -253,3 +253,76 @@ def test_abort_anywhere_fuzz_conserves_and_isolates():
     for ti in list(live):
         cm.cache_req(live.pop(ti), finished=True)
     cm.check_integrity()
+
+
+def test_shared_prefix_rounds_concurrent_conserves():
+    """The GPU crash class: concurrent shared-pad prompts of DIFFERENT lengths (peers admitted
+    before the first commit drains), then the same prompts again. Round 2's unfinished commits
+    walk round 1's tombstoned prefix with the tree path locked by a peer, so insert frees the
+    request's own dup pages past the windowed-safe match boundary while the row still points at
+    them -- the finish commit then freed the same pages a second time (free + tree > capacity).
+    The commit must re-point the WHOLE row to the tree's canonical slots and lock the deepest
+    walked node. Drives the real PrefillManager with the overlap ordering (batch N commits
+    after batch N+1 launches)."""
+    from collections import deque
+
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import ChunkedReq, PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    cm, pool, pt = _stack(num_pages=56)
+    tm = TableManager(max_running_reqs=MRR, page_table=pt)
+    pm = PrefillManager(cm, tm, DecodeManager(page_size=P))
+
+    pad = torch.arange(14 * P, dtype=torch.int32) % 100003
+    lens = (4 * P + 70, 9 * P + 40, 12 * P + 90, 14 * P + 100)
+    prompts = [torch.cat([pad[: n - 8], torch.full((8,), 50000 + i, dtype=torch.int32)])
+               for i, n in enumerate(lens)]
+
+    for _ in range(3):
+        decoding: list[Req] = []
+        pm.pending_list = [
+            PendingReq(uid=i, input_ids=p.clone(),
+                       sampling_params=SamplingParams(max_tokens=8))
+            for i, p in enumerate(prompts)
+        ]
+        launched = deque()
+        for step in range(400):
+            cur = None
+            if decoding and (step % 2 == 1 or not pm.runnable):
+                for r in decoding:
+                    r.append_host(torch.tensor([900 + step % 97], dtype=torch.int32))
+                    r.decode_batch_idx += 1
+                cm.maybe_free_swa_out_of_window(decoding, forward_iter=step)
+                cm.allocate_paged(decoding)
+                for r in decoding:
+                    r.complete_one()
+                cur = ("decode", list(decoding))
+            elif pm.runnable:
+                batch = pm.schedule_next_batch(16 * P)
+                if batch is not None:
+                    cm.free_swa_out_of_window_extend(batch.reqs)
+                    cm.allocate_paged(batch.reqs)
+                    for r in batch.reqs:
+                        r.complete_one()
+                    cur = ("prefill", batch.reqs)
+            if cur is not None:
+                launched.append(cur)
+            if launched:
+                phase, reqs = launched.popleft()  # overlap: batch N commits after N+1 launches
+                for r in reqs:
+                    if phase == "prefill":
+                        if isinstance(r, ChunkedReq) or r.table_idx == -1:
+                            continue
+                        cm.cache_req(r, finished=False)
+                        decoding.append(r)
+                    elif not r.can_decode:
+                        cm.cache_req(r, finished=True)
+                        tm.free(r.table_idx)
+                        r.table_idx = -1
+                        decoding.remove(r)
+            elif cur is None:
+                break
+        assert not decoding and not pm.runnable
+        cm.check_integrity()
