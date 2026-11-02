@@ -218,14 +218,14 @@ def fp4_act_quant_inplace(x: torch.Tensor, block: int = 32) -> torch.Tensor:
 def _fp8_act_gemm_kernel(
     a_ptr,            # [M, K] float8_e4m3fn (quantized activation)
     w_ptr,            # [N, K] float8_e4m3fn
-    sa_ptr,           # [M, K//128] uint8 (e8m0 act codes)
-    sb_ptr,           # [N//128, K//128] uint8 (e8m0 weight codes)
+    sa_ptr,           # [M, K//WB] uint8 (e8m0 act codes)
+    sb_ptr,           # [N//WB, K//WB] uint8 (e8m0 weight codes)
     c_ptr,            # [M, N] compute dtype
     M, N, K,
     stride_am, stride_ak, stride_wn, stride_wk,
     stride_sam, stride_sak, stride_sbn, stride_sbk,
     stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, WB: tl.constexpr,
     compute_type: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -248,9 +248,10 @@ def _fp8_act_gemm_kernel(
             p = tl.dot(a, tl.trans(e4m3_u8_to_f32(w).to(tl.bfloat16)), out_dtype=tl.float32)
         sa_code = tl.load(sa_ptr + offs_m * stride_sam + k * stride_sak, mask=m_mask, other=0)
         sca = tl.exp2(sa_code.to(tl.float32) - 127.0)            # [BLOCK_M]
-        sb_code = tl.load(sb_ptr + pid_n * stride_sbn + k * stride_sbk)
-        scb = tl.exp2(sb_code.to(tl.float32) - 127.0)            # scalar (one 128-N block)
-        acc += p * sca[:, None] * scb
+        # one weight scale per WB-wide N span (== BLOCK_N on V4's 128x128 grid)
+        sb_code = tl.load(sb_ptr + (offs_n // WB) * stride_sbn + k * stride_sbk)
+        scb = tl.exp2(sb_code.to(tl.float32) - 127.0)            # [BLOCK_N]
+        acc += p * sca[:, None] * scb[None, :]
         a_ptrs += BLOCK_K * stride_ak
         w_ptrs += BLOCK_K * stride_wk
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
@@ -260,31 +261,31 @@ def _fp8_act_gemm_kernel(
 @triton.jit
 def _fp8_act_gemv_splitk_kernel(
     a_ptr,            # [K] float8_e4m3fn
-    sa_ptr,           # [K//128] uint8 (e8m0 act codes)
+    sa_ptr,           # [K//WB] uint8 (e8m0 act codes)
     w_ptr,            # [N, K] float8_e4m3fn
-    sb_ptr,           # [N//128, K//128] uint8 (e8m0 weight codes)
+    sb_ptr,           # [N//WB, K//WB] uint8 (e8m0 weight codes)
     part_ptr,         # [SPLIT_K, N] fp32
     N, K,
     stride_ak, stride_wn, stride_wk, stride_sbn, stride_sbk, stride_pk, stride_pn,
-    BLOCK_N: tl.constexpr, SPLIT_K: tl.constexpr,
+    BLOCK_N: tl.constexpr, WB: tl.constexpr, SPLIT_K: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < N
-    sn = offs_n // 128
+    sn = offs_n // WB
     k_per = K // SPLIT_K
     k_start = pid_k * k_per
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    for k0 in range(0, k_per, 128):
-        offs_k = k_start + k0 + tl.arange(0, 128)
+    for k0 in range(0, k_per, WB):
+        offs_k = k_start + k0 + tl.arange(0, WB)
         a = tl.load(a_ptr + offs_k * stride_ak).to(tl.float32)
         w_ptrs = w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
         if e4m3_native_cx():
             w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
         else:
             w = e4m3_u8_to_f32(tl.load(w_ptrs, mask=n_mask[:, None], other=0))
-        kb = (k_start + k0) // 128
+        kb = (k_start + k0) // WB
         sb_code = tl.load(sb_ptr + sn * stride_sbn + kb * stride_sbk, mask=n_mask, other=0)
         scb = tl.exp2(sb_code.to(tl.float32) - 127.0)
         sa_code = tl.load(sa_ptr + kb)
@@ -316,29 +317,29 @@ _DECODE_FP8_CFG = {
 }
 
 
-def _decode_cfg(N: int, K: int) -> tuple[int, int, int]:
+def _decode_cfg(N: int, K: int, wb: int = 128) -> tuple[int, int, int]:
     cfg = _DECODE_FP8_CFG.get((N, K))
     if cfg is not None:
         bn, sk, nw = cfg
-        return bn, max(1, min(sk, K // 128)), nw
+        return bn, max(1, min(sk, K // wb)), nw
     bn = 16
     n_tiles = triton.cdiv(N, bn)
     sk = max(1, 1536 // n_tiles)
     sk = 1 << (sk.bit_length() - 1)
-    return bn, max(1, min(sk, K // 128)), 1
+    return bn, max(1, min(sk, K // wb)), 1
 
 
 def _fp8_act_gemv(a_fp8: torch.Tensor, sa: torch.Tensor, weight: torch.Tensor,
-                  sb: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+                  sb: torch.Tensor, out_dtype: torch.dtype, wb: int) -> torch.Tensor:
     N, K = weight.shape
-    BLOCK_N, split_k, num_warps = _decode_cfg(N, K)
+    BLOCK_N, split_k, num_warps = _decode_cfg(N, K, wb)
     n_tiles = triton.cdiv(N, BLOCK_N)
     part = torch.empty((split_k, N), dtype=torch.float32, device=a_fp8.device)
     _fp8_act_gemv_splitk_kernel[(n_tiles, split_k)](
         a_fp8, sa, weight, sb, part, N, K,
         a_fp8.stride(0), weight.stride(0), weight.stride(1),
         sb.stride(0), sb.stride(1), part.stride(0), part.stride(1),
-        BLOCK_N=BLOCK_N, SPLIT_K=split_k, num_warps=num_warps,
+        BLOCK_N=BLOCK_N, WB=wb, SPLIT_K=split_k, num_warps=num_warps,
     )
     out = torch.empty(N, dtype=out_dtype, device=a_fp8.device)
     _splitk_reduce_kernel[(triton.cdiv(N, 256),)](
@@ -353,28 +354,30 @@ def block_fp8_linear(
     weight: torch.Tensor,
     scale: torch.Tensor,
     bias: torch.Tensor | None = None,
+    block: int = 128,
 ) -> torch.Tensor:
     """``y = act_quant(x) @ weight^T`` (reference FP8 path).
 
     ``x``: ``[..., K]`` bf16; ``weight``: ``[N, K]`` float8_e4m3fn; ``scale``:
-    ``[N//128, K//128]`` float8_e8m0fnu (weight block scale). Activation is quantized
-    to FP8 with a per-128 ue8m0 scale; the GEMM applies both scales per 128-K block.
+    ``[N//block, K//block]`` float8_e8m0fnu (weight block scale). Activation is quantized
+    to FP8 with a per-``block`` ue8m0 scale; the GEMM applies both scales per K block.
+    128 on V4, 32 on V4.1 (whose weight scales are 32x32).
     """
     assert weight.dtype == FP8
     *lead, K = x.shape
     N = weight.shape[0]
     assert weight.shape[1] == K
-    assert K % 128 == 0 and N % 128 == 0, (N, K)
+    assert K % block == 0 and N % block == 0, (N, K)
     compute_dtype = x.dtype if x.dtype in _TL_DTYPE else torch.bfloat16
     sb = scale.view(torch.uint8) if scale.dtype == torch.float8_e8m0fnu else scale
     sb = sb.contiguous()
     w = e4m3_kernel_view(weight)
 
-    a_fp8, sa = act_quant_fp8(x, 128)  # [M,K] fp8, [M,K//128] e8m0 codes
+    a_fp8, sa = act_quant_fp8(x, block)  # [M,K] fp8, [M,K//block] e8m0 codes
     M = a_fp8.shape[0]
 
     if M == 1:
-        out = _fp8_act_gemv(a_fp8[0], sa[0], w, sb, compute_dtype).reshape(*lead, N)
+        out = _fp8_act_gemv(a_fp8[0], sa[0], w, sb, compute_dtype, block).reshape(*lead, N)
         if bias is not None:
             out = out + bias.to(out.dtype)
         return out
@@ -382,7 +385,7 @@ def block_fp8_linear(
     out = torch.empty((M, N), dtype=compute_dtype, device=x.device)
     BLOCK_M = 32
     BLOCK_N = 128
-    BLOCK_K = 128
+    BLOCK_K = block
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _fp8_act_gemm_kernel[grid](
         a_fp8, w, sa, sb, out,
@@ -390,7 +393,7 @@ def block_fp8_linear(
         a_fp8.stride(0), a_fp8.stride(1), w.stride(0), w.stride(1),
         sa.stride(0), sa.stride(1), sb.stride(0), sb.stride(1),
         out.stride(0), out.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, WB=block,
         compute_type=_TL_DTYPE[compute_dtype], num_warps=4, num_stages=3,
     )
     out = out.reshape(*lead, N)

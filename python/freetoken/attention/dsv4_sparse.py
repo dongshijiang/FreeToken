@@ -249,18 +249,24 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         self, q: torch.Tensor, layer_id: int, topk_idxs: torch.Tensor, n_window: int,
         attn_sink: torch.Tensor, softmax_scale: float,
         cmp_counts: torch.Tensor | None = None, has_compression: bool = True,
+        cmp_layer_id: int | None = None,
     ) -> torch.Tensor:
         """Paged sparse MLA attention over ``[window | compressed]`` global slots.
 
         ``cmp_counts`` bounds the compressed half per query from DEVICE memory, so a captured
-        graph's work tracks the live position instead of the staged width.
+        graph's work tracks the live position instead of the staged width. ``cmp_layer_id``
+        selects whose compressed pool the sparse half reads -- V4.1 consumer layers address
+        their ratio group's kv_source layer; None (V4) reads the caller's own layer.
         """
         from freetoken.kernel.triton.dsv4.sparse_attn import sparse_attn_paged
 
         pool = self.pool
         # ratio-0 layers have no compressed pool; the kernel never reads it there (n_window ==
         # topk), so alias the window pool to keep the two-pool stride assert happy.
-        cmp = pool.cmp_pool[layer_id] if has_compression else pool.window_pool[layer_id]
+        if has_compression:
+            cmp = pool.cmp_pool[cmp_layer_id if cmp_layer_id is not None else layer_id]
+        else:
+            cmp = pool.window_pool[layer_id]
         return sparse_attn_paged(
             q, pool.window_pool[layer_id], cmp, attn_sink,
             topk_idxs.int(), n_window, softmax_scale, cmp_counts=cmp_counts,

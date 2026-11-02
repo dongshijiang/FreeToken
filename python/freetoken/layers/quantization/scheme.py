@@ -80,8 +80,8 @@ def fp8_tensor_scheme(scale: str, *, per_row: bool = False, input_scale: bool = 
     return QuantScheme(QuantKind.FP8_TENSOR, WeightDesc("e4m3", (1, -1) if per_row else (-1, -1), scale), roles)
 
 
-def fp8_block_scheme(scale: str) -> QuantScheme:
-    return QuantScheme(QuantKind.FP8_BLOCK, WeightDesc("e4m3", (FP8_BLOCK, FP8_BLOCK), scale), {"weight", "weight_scale_inv"})
+def fp8_block_scheme(scale: str, block: int = FP8_BLOCK) -> QuantScheme:
+    return QuantScheme(QuantKind.FP8_BLOCK, WeightDesc("e4m3", (block, block), scale), {"weight", "weight_scale_inv"})
 
 
 def mxfp8_scheme() -> QuantScheme:

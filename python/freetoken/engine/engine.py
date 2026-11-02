@@ -488,12 +488,19 @@ class Engine:
         if self.linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        # Engram models host-sync inside decode (CPU-resident table gather), which is
+        # illegal in a captured graph; drop the capture list so decode stays eager.
+        # The rebuild path reuses the bs list parsed here, so one gate suffices.
+        cuda_graph_bs = config.cuda_graph_bs
+        if getattr(self.model, "needs_eager_decode", False):
+            logger.info_rank0("Model requires eager decode (engram host-sync lookup): CUDA graphs disabled")
+            cuda_graph_bs = []
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
+            cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,

@@ -14,7 +14,7 @@ Byte conventions:
   kv bytes    = head_dim       * 2  (bf16)
   index bytes = index_head_dim * 2  (bf16)
   state bytes = 2*(1+overlap)*head_dim * 4  (fp32);  overlap = (ratio == 4)
-  ring_size   = 8 (ratio 4) / 128 (ratio 128)
+  ring_size   = 2 (ratio 2) / 8 (ratio 4) / 128 (ratio 128)
 """
 
 from __future__ import annotations
@@ -40,11 +40,33 @@ def dsv4_reserved_window_pages(max_running_req: int, radix: bool) -> int:
 
 def ring_size_for_ratio(ratio: int) -> int:
     """Compress-state ring slots per window page (non-speculative)."""
+    if ratio == 2:
+        return 2  # V4.1 ratio-2: one carry row per in-block token offset
     if ratio == 4:
         return 8
     if ratio == 128:
         return 128
-    raise ValueError(f"no ring for ratio {ratio} (only 4 / 128)")
+    raise ValueError(f"no ring for ratio {ratio} (only 2 / 4 / 128)")
+
+
+def dsv4_tier_layers(args) -> tuple[list[int], list[int], list[int], list[int]]:
+    """(cmp, idx, attn-ring, idx-ring): the layers owning each per-layer tier.
+
+    V4 geometry: every ratio>0 layer owns a compressed pool + state ring; ratio-4
+    layers additionally own the indexer pool + its own state ring. V4.1 (CSA2)
+    geometry: only the kv_source layers own the compressed/indexer pools (consumers
+    address their group's source layer); the attention ring exists only where the
+    compressor carries state (ratio > 1 -- ratio 1 is a stateless projection), and
+    there is no indexer ring.
+    """
+    ratios = tuple(args.compress_ratios)[: args.n_layers]
+    sources = getattr(args, "kv_source_layer_ids", None)
+    if sources is None:
+        cmp_layers = [L for L, r in enumerate(ratios) if r]
+        idx_ring = [L for L in cmp_layers if ratios[L] == 4]
+        return cmp_layers, idx_ring, list(cmp_layers), idx_ring
+    cmp_layers = [L for L in tuple(sources) if L < len(ratios)]
+    return cmp_layers, list(cmp_layers), [L for L in cmp_layers if ratios[L] > 1], []
 
 
 def _kv_bytes(args) -> int:
@@ -69,32 +91,35 @@ def _idx_state_bytes(args) -> int:
 def dsv4_cache_per_page(args, swa_ratio: float, P: int = 128) -> int:
     """Bytes per P-token across ALL tiers, summed over layers per ratio class.
 
-    Window term scaled by ``swa_ratio``; compressed ``1/ratio``; indexer ``1/4``
-    (ratio-4 layers). The compress-state / indexer-state rings are sized off the
-    WINDOW pages (``state_slots = n_win_pages * ring_size`` in ``dsv4_pool_sizes``),
+    Window term scaled by ``swa_ratio``; compressed ``1/ratio``; indexer keys
+    ``1/ratio`` of their owning layer. The compress-state / indexer-state rings are sized
+    off the WINDOW pages (``state_slots = n_win_pages * ring_size`` in ``dsv4_pool_sizes``),
     so their per-page contribution is scaled by ``swa_ratio`` too -- matching the
     actual pool, not ``ring_size`` slots on every full page.
     """
     assert P % 1 == 0 and P > 0
     kv_b = _kv_bytes(args)
     idx_b = _index_bytes(args)
+    ratios = tuple(args.compress_ratios)[: args.n_layers]
+    cmp_layers, idx_layers, ring_layers, idx_ring_layers = dsv4_tier_layers(args)
 
     total = 0
-    for ratio in tuple(args.compress_ratios)[: args.n_layers]:
+    for _ratio in ratios:
         # Window tier exists on EVERY layer (all-sliding), scaled by swa_ratio.
         total += round(swa_ratio * P) * kv_b
-        if ratio == 0:
-            continue
+    for L in cmp_layers:
         # Compressed KV: P//ratio blocks per page.
-        total += (P // ratio) * kv_b
-        # Indexer KV: P//4 blocks per page (ratio-4 only).
-        if ratio == 4:
-            total += (P // 4) * idx_b
-            # Indexer compress-state ring: its own pool (ring_size=8, fp32), sized off
-            # the window pages -> swa_ratio-scaled per full page.
-            total += round(swa_ratio * ring_size_for_ratio(4)) * _idx_state_bytes(args)
+        total += (P // ratios[L]) * kv_b
+    for L in idx_layers:
+        # Indexer KV: one key per compressed block of the owning layer.
+        total += (P // ratios[L]) * idx_b
+    for _L in idx_ring_layers:
+        # Indexer compress-state ring (V4 ratio-4 only): its own pool (ring_size=8,
+        # fp32), sized off the window pages -> swa_ratio-scaled per full page.
+        total += round(swa_ratio * ring_size_for_ratio(4)) * _idx_state_bytes(args)
+    for L in ring_layers:
         # Compress-state ring: ring_size slots per WINDOW page (swa_ratio-scaled), fp32.
-        total += round(swa_ratio * ring_size_for_ratio(ratio)) * _state_bytes(args, ratio)
+        total += round(swa_ratio * ring_size_for_ratio(ratios[L])) * _state_bytes(args, ratios[L])
     return int(total)
 
 
@@ -106,13 +131,14 @@ def dsv4_kv_unit_bytes(args, P: int = 128) -> int:
     divides the VRAM budget by."""
     kv_b = _kv_bytes(args)
     idx_b = _index_bytes(args)
+    ratios = tuple(args.compress_ratios)[: args.n_layers]
+    cmp_layers, idx_layers, _ring_layers, _idx_ring_layers = dsv4_tier_layers(args)
+
     per_page = P * _INT64_BYTES  # full_to_window map: one int64 slot per full token
-    for ratio in tuple(args.compress_ratios)[: args.n_layers]:
-        if ratio == 0:
-            continue
-        per_page += (P // ratio) * kv_b  # compressed KV
-        if ratio == 4:
-            per_page += (P // 4) * idx_b  # indexer KV
+    for L in cmp_layers:
+        per_page += (P // ratios[L]) * kv_b  # compressed KV
+    for L in idx_layers:
+        per_page += (P // ratios[L]) * idx_b  # indexer KV
     return -(-per_page // P)  # ceil to bytes/token (conservative slider max)
 
 
@@ -123,13 +149,13 @@ def dsv4_window_unit_bytes(args, P: int = 128) -> int:
     how many window tokens exist, not the per-token cost. This is ``swa_bytes_per_token``."""
     kv_b = _kv_bytes(args)
     ratios = tuple(args.compress_ratios)[: args.n_layers]
+    _cmp_layers, _idx_layers, ring_layers, idx_ring_layers = dsv4_tier_layers(args)
+
     per_page = len(ratios) * P * kv_b  # window KV: P slots per page, every layer
-    for ratio in ratios:
-        if ratio == 0:
-            continue
-        per_page += ring_size_for_ratio(ratio) * _state_bytes(args, ratio)  # attn ring
-        if ratio == 4:
-            per_page += ring_size_for_ratio(4) * _idx_state_bytes(args)  # indexer ring
+    for L in ring_layers:
+        per_page += ring_size_for_ratio(ratios[L]) * _state_bytes(args, ratios[L])  # attn ring
+    for _L in idx_ring_layers:
+        per_page += ring_size_for_ratio(4) * _idx_state_bytes(args)  # indexer ring
     return -(-per_page // P)  # ceil to bytes/window-token
 
 
@@ -169,26 +195,25 @@ def dsv4_pool_sizes(
     n_win_pages = min(n_win_pages, num_pages)
     n_win_slots = n_win_pages * P
 
-    cmp_blocks: list[int | None] = []
-    idx_blocks: list[int | None] = []
-    state_slots: list[int | None] = []
-    ring_sizes: list[int | None] = []
-    idx_state_slots: list[int | None] = []
-    for ratio in tuple(args.compress_ratios)[: args.n_layers]:
-        if ratio == 0:
-            cmp_blocks.append(None)
-            idx_blocks.append(None)
-            state_slots.append(None)
-            ring_sizes.append(None)
-            idx_state_slots.append(None)
-            continue
-        rs = ring_size_for_ratio(ratio)
-        cmp_blocks.append(full_token // ratio)
-        idx_blocks.append(full_token // 4 if ratio == 4 else None)
-        state_slots.append(n_win_pages * rs)
-        ring_sizes.append(rs)
-        # Indexer ring (ratio-4 only) is sized like the attention ratio-4 ring.
-        idx_state_slots.append(n_win_pages * ring_size_for_ratio(4) if ratio == 4 else None)
+    cmp_blocks: list[int | None] = [None] * args.n_layers
+    idx_blocks: list[int | None] = [None] * args.n_layers
+    state_slots: list[int | None] = [None] * args.n_layers
+    ring_sizes: list[int | None] = [None] * args.n_layers
+    idx_state_slots: list[int | None] = [None] * args.n_layers
+    ratios = tuple(args.compress_ratios)[: args.n_layers]
+    cmp_layers, idx_layers, ring_layers, idx_ring_layers = dsv4_tier_layers(args)
+    for L in cmp_layers:
+        r = ratios[L]
+        cmp_blocks[L] = full_token // r
+        if L in ring_layers:
+            rs = ring_size_for_ratio(r)
+            state_slots[L] = n_win_pages * rs
+            ring_sizes[L] = rs
+    for L in idx_layers:
+        idx_blocks[L] = full_token // ratios[L]
+    for L in idx_ring_layers:
+        # Indexer ring (V4 ratio-4 only) is sized like the attention ratio-4 ring.
+        idx_state_slots[L] = n_win_pages * ring_size_for_ratio(4)
 
     return DSV4PoolSizes(
         P=P,
@@ -218,12 +243,13 @@ def dsv4_pool_bytes(sizes: DSV4PoolSizes, args, n_scratch: int = 1) -> int:
     total = len(ratios) * sizes.n_win_slots * kv_b  # window pool, every layer
     total += (sizes.full_token + 1) * _INT64_BYTES  # full_to_window (+ sentinel row)
     for L, ratio in enumerate(ratios):
-        if ratio == 0:
-            continue
-        total += (sizes.cmp_blocks[L] + n_scratch) * kv_b
-        total += (sizes.state_slots[L] + 1) * _state_bytes(args, ratio)
-        if ratio == 4:
+        if sizes.cmp_blocks[L] is not None:
+            total += (sizes.cmp_blocks[L] + n_scratch) * kv_b
+        if sizes.state_slots[L] is not None:
+            total += (sizes.state_slots[L] + 1) * _state_bytes(args, ratio)
+        if sizes.idx_blocks[L] is not None:
             total += (sizes.idx_blocks[L] + n_scratch) * idx_b
+        if sizes.idx_state_slots[L] is not None:
             total += (sizes.idx_state_slots[L] + 1) * _idx_state_bytes(args)
     return int(total)
 
@@ -297,6 +323,7 @@ __all__ = [
     "dsv4_pool_sizes",
     "dsv4_reserved_window_pages",
     "dsv4_solve_num_pages",
+    "dsv4_tier_layers",
     "dsv4_window_unit_bytes",
     "ring_size_for_ratio",
 ]

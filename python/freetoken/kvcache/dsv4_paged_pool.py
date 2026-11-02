@@ -3,10 +3,13 @@
 Four buffer families, sized from a budget (the cost model) not ``num_requests``:
 
 * ``window_pool[L]``  -- all layers; the 128-sliding KV ring, page-granular.
-* ``cmp_pool[L]``     -- ratio>0 layers; compressed KV, per-block.
-* ``idx_pool[L]``     -- ratio==4 layers; Lightning-Indexer compressed keys.
-* ``state_ring[L]``   -- ratio>0 layers; the per-window-page compress-state ring
-  (fp32, ``kv|score`` split), with index ``-1`` a permanent scratch slot.
+* ``cmp_pool[L]``     -- the compressed-KV owners (V4: ratio>0 layers; V4.1: the
+  kv_source layers, whose pools the group's consumer layers address).
+* ``idx_pool[L]``     -- the indexer-key owners (V4: ratio==4 layers; V4.1: the
+  kv_source layers).
+* ``state_ring[L]``   -- the stateful compressors' per-window-page compress-state ring
+  (fp32, ``kv|score`` split), with index ``-1`` a permanent scratch slot. V4.1
+  ratio-1 compressors are stateless and own none.
 
 The KV/compressed/indexer pools are bf16 (the fp8/fp4 quant is an in-place round-trip already
 baked into the bf16 value, so ``index_select`` staging is byte-exact); only the compress-state
@@ -213,64 +216,49 @@ class DSV4PagedKVCache(BaseKVCachePool):
             for _ in range(self._n_layers)
         ]
 
-        # Compressed KV / Indexer KV / compress-state ring: per ratio-class.
-        # ``state_ring`` is the ATTENTION compressor's ring (head_dim). Ratio-4
-        # layers additionally own an ``indexer_state_ring`` (index_head_dim) for
-        # the indexer's own compressor -- a separate pool, no collision.
-        self.cmp_pool: list[torch.Tensor | None] = []
-        self.idx_pool: list[torch.Tensor | None] = []
-        self.state_ring: list[CompressStateRing | None] = []
-        self.indexer_state_ring: list[CompressStateRing | None] = []
-        for L in range(self._n_layers):
-            ratio = self.compress_ratios[L]
-            if ratio == 0:
-                self.cmp_pool.append(None)
-                self.idx_pool.append(None)
-                self.state_ring.append(None)
-                self.indexer_state_ring.append(None)
-                self.cmp_scratch_base.append(None)
-                self.idx_scratch_base.append(None)
-                continue
+        # Compressed KV / Indexer KV / compress-state rings, per the cost model's tier
+        # ownership: V4 = every ratio>0 layer (idx + its ring on ratio-4); V4.1 = the
+        # kv_source layers only, the ring only where the compressor carries state
+        # (ratio > 1), and no indexer ring.
+        from .dsv4_cost_model import dsv4_tier_layers
 
-            self.cmp_scratch_base.append(sizes.cmp_blocks[L])
-            self.cmp_pool.append(
-                torch.zeros(
-                    sizes.cmp_blocks[L] + self.n_scratch, self.head_dim, device=device, dtype=dtype
-                )
+        cmp_layers, idx_layers, ring_layers, idx_ring_layers = dsv4_tier_layers(self.args)
+        ratios = self.compress_ratios
+        self.cmp_pool: list[torch.Tensor | None] = [None] * self._n_layers
+        self.idx_pool: list[torch.Tensor | None] = [None] * self._n_layers
+        self.state_ring: list[CompressStateRing | None] = [None] * self._n_layers
+        self.indexer_state_ring: list[CompressStateRing | None] = [None] * self._n_layers
+        self.cmp_scratch_base: list[int | None] = [None] * self._n_layers
+        self.idx_scratch_base: list[int | None] = [None] * self._n_layers
+        for L in cmp_layers:
+            self.cmp_scratch_base[L] = sizes.cmp_blocks[L]
+            self.cmp_pool[L] = torch.zeros(
+                sizes.cmp_blocks[L] + self.n_scratch, self.head_dim, device=device, dtype=dtype
             )
-            if ratio == 4:
-                self.idx_scratch_base.append(sizes.idx_blocks[L])
-                self.idx_pool.append(
-                    torch.zeros(
-                        sizes.idx_blocks[L] + self.n_scratch,
-                        self.index_head_dim,
-                        device=device,
-                        dtype=dtype,
-                    )
-                )
-                # Indexer compressor ring: index_head_dim, overlap, ring_size=8.
-                self.indexer_state_ring.append(
-                    CompressStateRing(
-                        n_slots=sizes.idx_state_slots[L],
-                        ring_size=ring_size_for_ratio(4),
-                        overlap=True,
-                        head_dim=self.index_head_dim,
-                        device=device,
-                    )
-                )
-            else:
-                self.idx_pool.append(None)
-                self.indexer_state_ring.append(None)
-                self.idx_scratch_base.append(None)
-
-            self.state_ring.append(
-                CompressStateRing(
-                    n_slots=sizes.state_slots[L],
-                    ring_size=ring_size_for_ratio(ratio),
-                    overlap=(ratio == 4),
-                    head_dim=self.head_dim,
-                    device=device,
-                )
+        for L in idx_layers:
+            self.idx_scratch_base[L] = sizes.idx_blocks[L]
+            self.idx_pool[L] = torch.zeros(
+                sizes.idx_blocks[L] + self.n_scratch,
+                self.index_head_dim,
+                device=device,
+                dtype=dtype,
+            )
+        for L in ring_layers:
+            self.state_ring[L] = CompressStateRing(
+                n_slots=sizes.state_slots[L],
+                ring_size=ring_size_for_ratio(ratios[L]),
+                overlap=(ratios[L] == 4),
+                head_dim=self.head_dim,
+                device=device,
+            )
+        for L in idx_ring_layers:
+            # Indexer compressor ring (V4 ratio-4 only): index_head_dim, overlap, ring_size=8.
+            self.indexer_state_ring[L] = CompressStateRing(
+                n_slots=sizes.idx_state_slots[L],
+                ring_size=ring_size_for_ratio(4),
+                overlap=True,
+                head_dim=self.index_head_dim,
+                device=device,
             )
 
     # ----- full-loc translation (gather-only -1 safety; see field comment) -----

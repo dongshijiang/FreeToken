@@ -12,7 +12,13 @@ import torch
 
 from freetoken.core import Batch, Context, Req, SamplingParams, get_global_ctx, set_global_ctx
 from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
-from freetoken.kvcache.dsv4_cost_model import dsv4_pool_sizes
+from freetoken.kvcache.dsv4_cost_model import (
+    dsv4_cache_per_page,
+    dsv4_kv_unit_bytes,
+    dsv4_pool_sizes,
+    dsv4_tier_layers,
+    dsv4_window_unit_bytes,
+)
 from freetoken.models.deepseek_v4.args import DeepseekV4Args
 
 P, MRR, DEVICE = 128, 4, torch.device("cpu")
@@ -204,3 +210,56 @@ def test_recapture_reallocates_a_clean_buffer_at_the_new_ceiling():
     backend.prepare_for_replay(narrow)
     assert narrow.attn_metadata.full_snap.shape[1] == 512
     assert int(narrow.attn_metadata.full_snap[0, 0]) == 32 * P
+
+
+def _v41_args():
+    from freetoken.models.deepseek_v41.args import DeepseekV41Args
+
+    # Miniature V4.1: ratio-2 sources at 0/3, a ratio-1 source at 7, consumers between.
+    return DeepseekV41Args(
+        dim=64, n_layers=8, n_heads=4, head_dim=64, index_head_dim=32,
+        window_size=32, moe_inter_dim=16, n_routed_experts=2, n_activated_experts=1,
+        vocab_size=64, compress_ratios=(2, 2, 2, 2, 1, 1, 1, 1),
+        kv_source_layer_ids=(0, 3, 7),
+    )
+
+
+def test_v41_tier_geometry_puts_pools_only_on_source_layers():
+    """V4.1 (CSA2): only the kv_source layers own cmp/idx pools (consumers address their
+    group's source layer); the attention ring exists only where the compressor carries
+    state (ratio > 1 -- ratio 1 is a stateless projection) and there is no indexer ring.
+    V4 geometry (no kv_source attr) is unchanged: every ratio>0 layer owns cmp + ring,
+    and ratio-4 layers add the indexer pool + its ring."""
+    v4 = DeepseekV4Args(
+        max_batch_size=2, dim=64, n_layers=4, n_heads=2, q_lora_rank=32,
+        o_lora_rank=32, o_groups=2, moe_inter_dim=16, n_routed_experts=2,
+        n_activated_experts=1, vocab_size=64, index_n_heads=2, index_topk=8,
+        compress_ratios=(0, 4, 128, 4), head_dim=64, index_head_dim=32,
+        window_size=32,
+    )
+    assert dsv4_tier_layers(v4) == ([1, 2, 3], [1, 3], [1, 2, 3], [1, 3])
+    assert dsv4_tier_layers(_v41_args()) == ([0, 3, 7], [0, 3, 7], [0, 3], [])
+
+
+def test_v41_pool_sizes_ring_two_per_ratio_two_source_layer():
+    """V4.1 pool shape at P=32 / swa=0.5 / 10 pages (full 320 tok, win 5 pages):
+    cmp+idx sized on all three source layers, ring slots only on the ratio-2 ones
+    (one carry row per in-block token offset -> ring_size 2, window-page scaled),
+    no indexer ring, and the byte totals match the hand expansion."""
+    args = _v41_args()
+    # The ratio-1 source (L7) keeps a 1:1 latent pool: P // 1 = P blocks per page.
+    assert dsv4_cache_per_page(args, 0.5, P=32) == 29696   # win 16384 + cmp 8192 + idx 4096 + ring 1024
+    assert dsv4_kv_unit_bytes(args, P=32) == 392           # map 256 + cmp 8192 + idx 4096, ceil/32
+    assert dsv4_window_unit_bytes(args, P=32) == 1088      # win 32768 + ring 2048, ceil/32
+
+    sizes = dsv4_pool_sizes(num_pages=10, args=args, swa_ratio=0.5, P=32)
+    assert (sizes.n_win_pages, sizes.n_win_slots) == (5, 160)
+    assert sizes.cmp_blocks == [160, None, None, 160, None, None, None, 320]
+    assert sizes.idx_blocks == sizes.cmp_blocks
+    assert sizes.state_slots == [10, None, None, 10, None, None, None, None]
+    assert sizes.ring_sizes == [2, None, None, 2, None, None, None, None]
+    assert sizes.idx_state_slots == [None] * 8
+    # win 163840 + map 2568 + cmp 82304 + ring 11264 + idx 41152
+    from freetoken.kvcache.dsv4_cost_model import dsv4_pool_bytes
+
+    assert dsv4_pool_bytes(sizes, args, n_scratch=1) == 301128

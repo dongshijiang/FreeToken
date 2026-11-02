@@ -5,13 +5,13 @@ from typing import Any, ClassVar
 from ..names import is_routed_expert, name_set, substr_set
 from ..registry import register_dialect
 from ..scheme import QuantKind, QuantScheme
-from ..scheme import FP8_BLOCK, fp8_block_scheme, fp8_tensor_scheme, mxfp4_scheme
+from ..scheme import FP8_BLOCK, MX_GROUP, fp8_block_scheme, fp8_tensor_scheme, mxfp4_scheme
 from .base import QuantConfig, Stored, cfg_get
 
 
 @register_dialect
 class Fp8BlockConfig(QuantConfig):
-    """HF ``quant_method: fp8`` (DeepSeek-V3 style 128x128 block scales) plus the DeepSeek-V4 e8m0 / fp4-expert variant."""
+    """HF ``quant_method: fp8`` (DeepSeek-V3 style 128x128 block scales) plus the DeepSeek-V4 e8m0 / fp4-expert variant. V4.1 ships 32x32 blocks."""
 
     dialect = "fp8"
 
@@ -32,15 +32,23 @@ class Fp8BlockConfig(QuantConfig):
     def __init__(self, q: dict[str, Any], hf_config: Any = None, *, name_map=None, unquantized=()):
         super().__init__(name_map, unquantized)
         block = tuple(int(x) for x in (q.get("weight_block_size") or ()))
-        if q.get("weight_per_tensor") or block != (FP8_BLOCK, FP8_BLOCK):
-            raise NotImplementedError(f"fp8 checkpoint with weight_block_size={block} per_tensor={q.get('weight_per_tensor')} is not supported; only 128x128 blocks are")
+        if q.get("weight_per_tensor") or block not in ((FP8_BLOCK, FP8_BLOCK), (MX_GROUP, MX_GROUP)):
+            raise NotImplementedError(
+                f"fp8 checkpoint with weight_block_size={block} per_tensor={q.get('weight_per_tensor')} "
+                f"is not supported; only {MX_GROUP}x{MX_GROUP} and {FP8_BLOCK}x{FP8_BLOCK} blocks are"
+            )
+        self.block = block[0]
         # transformers skips lm_head when the checkpoint gives no list
         not_convert = tuple(q.get("modules_to_not_convert") or ("lm_head",))
         self.not_convert = name_set(not_convert)
         self.not_convert_substr = substr_set(not_convert)
         self.convert_tables = name_set(tuple(q.get("modules_to_convert") or ()))
         self.e8m0 = str(q.get("scale_fmt") or "").lower() == "ue8m0"
-        self.expert_fp4 = str(cfg_get(hf_config, "expert_dtype") or "").lower() == "fp4"
+        self.expert_fp4 = str(
+            q.get("expert_dtype") or cfg_get(hf_config, "expert_dtype") or ""
+        ).lower() == "fp4"
+        # the dense scheme is per-checkpoint (block size); SCHEMES keeps the 128x128 class defaults
+        self.block_scheme = fp8_block_scheme("e8m0" if self.e8m0 else "float", block=self.block)
 
     def storage(self, scheme: QuantScheme) -> dict[str, Stored]:
         names = super().storage(scheme)
@@ -55,4 +63,4 @@ class Fp8BlockConfig(QuantConfig):
             return None
         if self.expert_fp4 and is_routed_expert(name):
             return self.SCHEMES["EXPERT_MXFP4"]
-        return self.SCHEMES["BLOCK_E8M0" if self.e8m0 else "BLOCK"]
+        return self.block_scheme
