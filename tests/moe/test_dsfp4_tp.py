@@ -10,6 +10,10 @@ down byte / scale columns. Verified here as:
   - the kernel math: rank0 + rank1 routed outputs equal the full-bank output
     within bf16 rounding (the gate_up / swiglu / fp8-requant chain is exact per
     rank, the down GEMV differs only in fp32 accumulation order).
+
+Geometries: the DSV4 production shape (I=2048 -> TP2 local 1024, both ranks on
+the 128-byte decode tile) and the DSV4.1-Flash shape (I=2304 -> TP2 local 1152,
+whose 576-byte down rows drop the rank GEMV onto the 64-byte tile).
 """
 
 import pytest
@@ -21,6 +25,7 @@ from freetoken.layers.quantization.moe.mxfp4 import TritonMxfp4MoEKernel
 E, H, I, TOP_K = 64, 1024, 2048, 6
 LIMIT = 7.0
 # TP2 local intermediate = I // 2 = 1024 (the DSV4 production value: moe_inter_dim 2048).
+V41_H, V41_I = 5120, 2304   # DSV4.1-Flash: TP2 local = 1152, down rows = 576 bytes
 
 
 def _cfg(rank, size):
@@ -68,13 +73,29 @@ def test_unusable_reason_accepts_tp2():
 
 
 def test_unusable_reason_rejects_unaligned_local_intermediate():
-    # 300 % 2 == 0 but local 150 breaks the 256-alignment of byte/scale groups.
+    # 300 % 2 == 0 but local 150 breaks the 128-alignment of the byte/scale
+    # groups, the fp8 activation round-trip block and the GEMV's 64-byte floor.
     cfg = MoEConfig(
         num_experts=E, hidden=H, intermediate=300, top_k=TOP_K,
         tp_rank=0, tp_size=2, strategy="offload",
     )
     reason = TritonMxfp4MoEKernel().unusable_reason(cfg)
-    assert reason is not None and "multiple of 256" in reason
+    assert reason is not None and "multiple of 128" in reason
+
+
+def test_unusable_reason_accepts_v41_flash_tp2():
+    # DSV4.1-Flash: intermediate 2304, TP2 local 1152. Not a multiple of 256, but
+    # every real constraint (32-wide e8m0 groups, 128-value fp8 round-trip
+    # blocks, the decode GEMV's 64-byte packed-row floor) is satisfied.
+    cfg = MoEConfig(
+        num_experts=E, hidden=V41_H, intermediate=V41_I, top_k=TOP_K,
+        tp_rank=0, tp_size=2, strategy="offload",
+    )
+    assert TritonMxfp4MoEKernel().unusable_reason(cfg) is None
+    i0 = V41_I // 2
+    out = TritonMxfp4MoEKernel().layout(cfg)
+    assert out["down"].shape == (V41_H, i0 // 2)
+    assert i0 % 128 == 0 and (i0 // 2) % 64 == 0 and (i0 // 2) % 128 != 0
 
 
 def test_layout_uses_local_intermediate():
@@ -125,23 +146,23 @@ def test_pack_tp2_reconstructs_full_banks():
 # Kernel math: rank0 + rank1 == full (CUDA).
 # ---------------------------------------------------------------------------
 
-def _rank_banks(device):
+def _rank_banks(device, h, i):
     """Full banks plus the per-rank (gate|up-concatenated, down-sliced) banks."""
     g = torch.Generator(device="cpu").manual_seed(0)
 
     def u8(*shape, low=0, high=256):
         return torch.randint(low, high, shape, dtype=torch.uint8, generator=g).to(device)
 
-    i0 = I // 2
-    gup = u8(E, 2 * I, H // 2)   # [gate(0:I); up(I:2I)]
-    gus = u8(E, 2 * I, H // 32, low=118, high=134)
-    dn = u8(E, H, I // 2)
-    dns = u8(E, H, I // 32, low=118, high=134)
+    i0 = i // 2
+    gup = u8(E, 2 * i, h // 2)   # [gate(0:i); up(i:2i)]
+    gus = u8(E, 2 * i, h // 32, low=118, high=134)
+    dn = u8(E, h, i0)
+    dns = u8(E, h, i // 32, low=118, high=134)
 
     def rank_of(rank):
         def gu(t):
             return torch.cat(
-                [t[:, rank * i0:(rank + 1) * i0], t[:, I + rank * i0:I + (rank + 1) * i0]],
+                [t[:, rank * i0:(rank + 1) * i0], t[:, i + rank * i0:i + (rank + 1) * i0]],
                 dim=1,
             ).contiguous()
         return (
@@ -153,16 +174,14 @@ def _rank_banks(device):
     return gup, gus, dn, dns, rank_of
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_routed_experts_fp4_tp2_sum_matches_full():
-    pytest.importorskip("triton")
+def _assert_tp2_sum_matches_full(h, i):
     from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
 
     device = "cuda"
-    gup, gus, dn, dns, rank_of = _rank_banks(device)
+    gup, gus, dn, dns, rank_of = _rank_banks(device, h, i)
 
     g = torch.Generator(device="cpu").manual_seed(1)
-    x = (torch.randn(16, H, dtype=torch.bfloat16, generator=g) * 0.1).to(device)
+    x = (torch.randn(16, h, dtype=torch.bfloat16, generator=g) * 0.1).to(device)
     slots = torch.stack([torch.randperm(E, generator=g)[:TOP_K] for _ in range(16)]).to(
         device=device, dtype=torch.int32
     ).contiguous()
@@ -191,3 +210,17 @@ def test_routed_experts_fp4_tp2_sum_matches_full():
     tol = 4 * ulp(torch.tensor(mmax)) + 1.0
     assert (diff <= tol).all(), (diff.max().item(), diff.argmax().item(), tol.item())
     assert (out == ref).float().mean().item() > 0.4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_routed_experts_fp4_tp2_sum_matches_full():
+    pytest.importorskip("triton")
+    _assert_tp2_sum_matches_full(H, I)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_routed_experts_fp4_tp2_sum_matches_full_v41_flash():
+    # The rank GEMV's 576-byte down rows exercise the 64-byte decode tile while
+    # the full bank stays on the 128-byte tile; the shard identity must hold.
+    pytest.importorskip("triton")
+    _assert_tp2_sum_matches_full(V41_H, V41_I)

@@ -66,9 +66,13 @@ def _grouped_decode(
     # scale), not weight HBM bandwidth -- so it tops out ~29% of HBM peak. BN=16/
     # BKB=128/1 warp maximizes memory-level parallelism (many single-warp CTAs, no
     # cross-warp reduction) -> ~950 GB/s on H100 (was ~830 at BN=8/BKB=256/2). K_BYTES
-    # must be a multiple of BLOCK_SIZE_KB (gate_up 2048, down 1024 -- both /128).
+    # must be a multiple of BLOCK_SIZE_KB (the kernel's K loop has no byte-tail mask):
+    # 128 keeps the TP=1 shapes (gate_up H/2, down I/2) on the widest tile, and a
+    # 64-byte-aligned TP shard (e.g. DSV4.1-Flash TP=2 down: I/2=576 bytes) drops to
+    # the 64-byte tile -- NB (== BLOCK_SIZE_KB // 16) scale blocks stay whole either
+    # way, so the dequant structure and its exp2 amortization are unchanged.
     BLOCK_SIZE_N = 16
-    BLOCK_SIZE_KB = 128
+    BLOCK_SIZE_KB = 128 if (K // 2) % 128 == 0 else 64
     _NW = 1
     assert (K // 2) % BLOCK_SIZE_KB == 0, (K, BLOCK_SIZE_KB)
     grid = (total_routes, triton.cdiv(N, BLOCK_SIZE_N))

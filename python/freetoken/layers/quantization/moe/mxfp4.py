@@ -29,15 +29,16 @@ class TritonMxfp4MoEKernel(MoEKernel):
     @staticmethod
     def _tp_geometry_reason(cfg: MoEConfig) -> str | None:
         """TP shards the intermediate axis only, so the local shard must keep the
-        e2m1 byte pairs, the 32-wide e8m0 scale groups and the decode kernel's
-        ``(K // 2) % 128`` assertion (K = local intermediate) intact."""
+        e2m1 byte pairs, the 32-wide e8m0 scale groups, the FP8 round-trip's
+        128-value blocks and the decode GEMV's 64-byte packed-row floor intact."""
         if cfg.tp_size <= 1:
             return None
         if cfg.intermediate % cfg.tp_size:
             return f"intermediate {cfg.intermediate} is not divisible by TP size {cfg.tp_size}"
-        if cfg.local_intermediate % 256:
-            return (f"local intermediate {cfg.local_intermediate} is not a multiple of 256 "
-                    "(mxfp4 byte/scale groups and the decode kernel's 128-bytes-per-block)")
+        if cfg.local_intermediate % 128:
+            return (f"local intermediate {cfg.local_intermediate} is not a multiple of 128 "
+                    "(mxfp4 byte/scale groups, the FP8 activation round-trip block and "
+                    "the decode GEMV's 64-byte packed-row floor)")
         return None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
