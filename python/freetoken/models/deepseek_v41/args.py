@@ -16,6 +16,31 @@ from typing import Literal, Tuple
 
 
 @dataclass
+class DeepseekV41VisionArgs:
+    """The checkpoint's ``vision_config`` section; field names stay verbatim.
+
+    Serves the released 2D-RoPE ViT (patch 14, full bidirectional attention,
+    RMSNorm eps 1e-6) and the padded spatial aligner (GELU, downsample_ratio 3).
+    """
+
+    num_hidden_layers: int = 32
+    hidden_size: int = 1024
+    num_attention_heads: int = 16
+    intermediate_size: int = 2816
+    patch_size: int = 14
+    rope_theta: float = 10000.0
+    downsample_ratio: int = 3
+    # image-span budget: 2 + llm_h * (llm_w + 1) tokens per image
+    max_image_tokens: int = 1024
+    min_pixels: int = 295936
+    max_wh_ratio: float | None = None
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_attention_heads
+
+
+@dataclass
 class DeepseekV41Args:
     # ----- runtime -----
     max_batch_size: int = 1
@@ -102,6 +127,10 @@ class DeepseekV41Args:
     engram_pad_token_id: int = 2
     engram_compressed_vocab_size: int = 99092
 
+    # ----- vision (absent on text-only releases) -----
+    image_token_id: int | None = None
+    vision_args: DeepseekV41VisionArgs | None = None
+
     def __post_init__(self) -> None:
         # JSON lists -> tuple so the dataclass stays hashable / immutable-ish.
         for name in (
@@ -140,6 +169,16 @@ _SCALING_ALIASES = {
 }
 
 
+def load_vision_args(raw: dict) -> DeepseekV41VisionArgs:
+    """Build :class:`DeepseekV41VisionArgs` from the raw ``vision_config`` JSON section.
+
+    The checkpoint's field names already match the dataclass, so unknown keys
+    (e.g. torch_dtype) are dropped and the rest map 1:1.
+    """
+    valid = {f.name for f in fields(DeepseekV41VisionArgs)}
+    return DeepseekV41VisionArgs(**{k: v for k, v in raw.items() if k in valid})
+
+
 def load_args(model_path: str, **overrides) -> DeepseekV41Args:
     """Build :class:`DeepseekV41Args` from the checkpoint's ``config.json``.
 
@@ -171,8 +210,12 @@ def load_args(model_path: str, **overrides) -> DeepseekV41Args:
             kwargs.setdefault("weight_block_size", tuple(quant["weight_block_size"]))
     else:
         kwargs.setdefault("dtype", "bf16")
+    vision = raw.get("vision_config") or {}
+    if vision:
+        kwargs["vision_args"] = load_vision_args(vision)
+        kwargs["image_token_id"] = raw.get("image_token_id")
     kwargs.update(overrides)
     return DeepseekV41Args(**kwargs)
 
 
-__all__ = ["DeepseekV41Args", "load_args"]
+__all__ = ["DeepseekV41Args", "DeepseekV41VisionArgs", "load_args", "load_vision_args"]

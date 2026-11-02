@@ -9,6 +9,10 @@
   - :func:`iter_expert_pieces` streams the routed MXFP4 experts (e2m1 pairs + e8m0
     per-row/32-col scales, no global) as per-expert pieces for the expert quant
     method's banks. The nextn (DSpark draft) experts live under ``mtp.`` and never match.
+  - :func:`_iter_vision` streams the unquantized bf16 vision stack: the ViT and the
+    aligner keep their checkpoint names under ``vision.`` and the three delimiter
+    vectors (``image_start`` / ``image_end`` / ``image_newline``) move under it, so
+    the single ``vision.`` VISION_KEY_PREFIXES entry covers the whole tower.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from typing import Iterator
 
 import safetensors
 import torch
@@ -102,12 +107,27 @@ def vocab_rows(value: torch.Tensor, *, rank: int, size: int, vocab_size: int) ->
     return value[start:start + n].clone()
 
 
+def _iter_vision(reader: _ShardReader, weight_map: dict) -> Iterator[tuple[str, torch.Tensor]]:
+    """The unquantized bf16 vision stack, replicated: the ViT and aligner keep their
+    checkpoint names under ``vision.``; the delimiter vectors move under it too. The
+    ViT attention is per-image full attention and the aligner reduces over 3x3 patch
+    groups, so no tensor is TP-sharded."""
+    for name in weight_map:
+        if name.startswith("vision."):
+            yield name, reader.get(name)
+        elif name.startswith("aligner."):
+            yield f"vision.{name}", reader.get(name)
+        elif name in ("image_start", "image_end", "image_newline"):
+            yield f"vision.{name}", reader.get(name)
+
+
 def iter_weights(
     model_path: str,
     device,
     *,
     include_moe_experts: bool = True,
     include_non_moe: bool = True,
+    include_vision: bool = True,
 ):
     """Stream resident (non-expert) weights as ``(name, tensor)`` keyed to engine params.
 
@@ -126,7 +146,8 @@ def iter_weights(
 
     args = load_args(model_path, max_batch_size=1)
     block = args.weight_block_size[0]
-    reader = _ShardReader(model_path, _weight_map(model_path), device)
+    wmap = _weight_map(model_path)
+    reader = _ShardReader(model_path, wmap, device)
 
     tp = get_tp_info()
     rank, size = tp.rank, tp.size
@@ -245,6 +266,19 @@ def iter_weights(
                 yield from linear(f"{e}.wkv", f"model.{e}.wkv")
                 yield f"model.{e}.q_weight", get(f"{e}.q_weight")
                 yield f"model.{e}.k_weight", get(f"{e}.k_weight")
+
+        if include_vision:
+            yield from _iter_vision(reader, wmap)
+    finally:
+        reader.close()
+
+
+def iter_vision_weights(model_path: str, device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision tower alone, named as iter_weights names it."""
+    wmap = _weight_map(model_path)
+    reader = _ShardReader(model_path, wmap, device)
+    try:
+        yield from _iter_vision(reader, wmap)
     finally:
         reader.close()
 
@@ -298,4 +332,4 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
     return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
 
 
-__all__ = ["iter_weights", "iter_expert_pieces"]
+__all__ = ["iter_weights", "iter_expert_pieces", "iter_vision_weights"]

@@ -163,22 +163,32 @@ class NgramHash:
             self.multipliers = self.multipliers.to(device)
             self._device = device
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:
         """``[B, S]`` raw tokenizer ids -> ``[B, S, n_layers, hash_heads]`` hash rows.
         Lookback never crosses the sequence start (padded with the pad id, whose
-        contribution is deterministic, mirroring the reference)."""
+        contribution is deterministic, mirroring the reference). ``token_mask`` marks
+        the text rows: image rows (content pad ids above the vocabulary) hash as the
+        pad id and block every n-gram that reaches them."""
         if input_ids.ndim != 2:
             raise ValueError("Engram input_ids must be [batch, sequence]")
         self._to(input_ids.device)
         batch, sequence = input_ids.shape
-        compressed = self.token_map[input_ids.long()]
+        if token_mask is None:
+            compressed = self.token_map[input_ids.long()]
+        else:
+            # image rows carry pad ids far above the vocabulary: clamp before the
+            # table gather, the sentinel below overwrites them anyway
+            compressed = torch.where(
+                token_mask, self.token_map[input_ids.clamp_max(self.token_map.numel() - 1).long()], -1
+            )
         positions = torch.arange(sequence, device=input_ids.device).expand(batch, sequence)
         blocked = torch.zeros_like(positions, dtype=torch.bool)
         tokens = []
         for shift in range(self.max_ngram_size):
             source_positions = positions - shift
             source = compressed.gather(1, source_positions.clamp_min(0))
-            blocked = blocked | (source_positions < 0)
+            # -1 is the image sentinel: an n-gram reaching one hashes as the pad id
+            blocked = blocked | (source_positions < 0) | (source == -1)
             tokens.append(torch.where(blocked, self.pad_id, source))
         products = torch.stack(tokens, dim=-1).unsqueeze(2) * self.multipliers
         rolling, hashes = products[..., 0], []
@@ -254,11 +264,12 @@ class EngramLayer(BaseOP):
         emb = emb * scale.repeat_interleave(groups, dim=-1)
         return emb.to(torch.bfloat16).view(*hash_ids.shape[:2], self.hash_heads * self.head_dim)
 
-    def forward(self, x: torch.Tensor, embeddings: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, embeddings: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Inject the normalized, signed-square-root-gated memory residual.
 
         ``x`` is ``[B, S, hc_mult, dim]``; ``embeddings`` is ``[B, S, hash_heads *
-        head_dim]`` from :meth:`lookup`. Returns the updated streams (no aliasing).
+        head_dim]`` from :meth:`lookup`. ``token_mask`` marks the text rows: image
+        rows keep their streams. Returns the updated streams (no aliasing).
         """
         bsz, seq = x.shape[:2]
         key, value = self.wkv.forward(embeddings).split(
@@ -272,6 +283,9 @@ class EngramLayer(BaseOP):
         )
         dot = (hidden * weights * key).sum(-1) * rstd * self.hidden_size ** -0.5
         gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+        if token_mask is not None:
+            # image rows keep their streams: the memory read only writes text rows
+            gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
         out = hidden + gate.unsqueeze(-1) * value.float().unsqueeze(-2)
         return out.to(x.dtype).view(bsz, seq, self.hc_mult, self.hidden_size)
 

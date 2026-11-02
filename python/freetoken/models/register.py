@@ -84,6 +84,8 @@ _MINIMAX_M3_PACKED = _DENSE_PACKED + (
 ) + _EXPERTS_W123_PACKED
 _MINIMAX_M3_PROCESSOR = "freetoken.mm.processors.minimax_m3:MiniMaxM3MMProcessor"
 _MINIMAX_M3_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+_DSV41_PROCESSOR = "freetoken.mm.processors.deepseek_v41:DeepseekV41MMProcessor"
+_DSV41_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 
 _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "LlamaForCausalLM": ModelSpec(
@@ -156,8 +158,10 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         # the head, the KV compressors and the indexer's scorer ship bf16; the fp8 config has no modules_to_not_convert
         unquantized_modules=("head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.weights_proj"),
     ),
-    # Text-only sibling served off the multimodal wrapper's text_config; the 3 nextn
-    # (DSpark draft) layers and gate bias_vl are not loaded.
+    # DeepSeek-V4.1-Flash: one arch name serves both releases; the multimodal wrapper
+    # (vision_config present) adds the 2D-RoPE ViT under model.vision. + the aligner,
+    # remapped by the family loader to "vision.". A text-only checkpoint parses no
+    # vision_config, so get_mm_processor declines and load_weight drops the section.
     "DeepseekV41ForCausalLM": ModelSpec(
         "freetoken.models.deepseek_v41",
         "DeepseekV41ForCausalLM",
@@ -171,6 +175,8 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
             "head", "*.compressor.wkv", "*.compressor.wgate",
             "*.indexer.wk", "*.indexer.weights_proj", "*.attn_sink",
         ),
+        mm_processor=_DSV41_PROCESSOR,
+        encoders=_DSV41_ENCODERS,
     ),
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",

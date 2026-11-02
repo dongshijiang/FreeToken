@@ -12,6 +12,7 @@ from freetoken.message import MMItem
 from freetoken.mm import MM_PAD_SHIFT_VALUE
 from freetoken.mm.config import MultimodalConfig
 from freetoken.mm.processor import MMProcessor, PromptReplacement, image_positions
+from freetoken.mm.processors.deepseek_v41 import DeepseekV41MMProcessor
 from freetoken.mm.processors.gemma4 import Gemma4MMProcessor, Gemma4UnifiedMMProcessor
 from freetoken.mm.processors.glm5_next import Glm5NextMMProcessor
 from freetoken.mm.processors.muse_glimmer import MuseGlimmerMMProcessor
@@ -390,6 +391,47 @@ def test_minimax_token_budget_becomes_pixel_bounds_and_the_span_gets_start_end_t
     assert dummy.feature.shape == (4, 1176) and dummy.num_tokens == 1
 
 
+def _dsv41_config(vision=True):
+    return SimpleNamespace(
+        architectures=["DeepseekV41ForCausalLM"],
+        image_token_id=129264,
+        vision_config=(
+            SimpleNamespace(patch_size=14, downsample_ratio=3, max_image_tokens=1024, min_pixels=295936, max_wh_ratio=None)
+            if vision
+            else None
+        ),
+        text_config=SimpleNamespace(vocab_size=129280),
+    )
+
+
+def test_dsv41_processor_plans_the_released_grid_and_span():
+    from PIL import Image
+
+    proc = DeepseekV41MMProcessor(_dsv41_config(), "/nonexistent", MultimodalConfig())
+    (item,) = proc.process([Image.new("RGB", (512, 384))])
+    # 512x384 upsizes to the min_pixels floor (630x476): 34x45 patches -> a 12x15 llm grid
+    assert item.vit_grid == (34, 45) and item.llm_grid == (12, 15)
+    assert item.feature.shape == (34 * 45, 3, 14, 14) and item.feature.dtype == torch.bfloat16
+    assert item.pad_value >= MM_PAD_SHIFT_VALUE and proc.positions(10, [item]) is None
+    assert proc.placeholder == [129264] and proc.prompt_replacement(item).full == [129264] * (2 + 12 * 16)
+
+
+def test_dsv41_image_min_tokens_raises_the_resize_floor_and_max_is_checked_at_start_up():
+    from PIL import Image
+
+    proc = DeepseekV41MMProcessor(_dsv41_config(), "/nonexistent", MultimodalConfig(image_min_tokens=4))
+    # min_pixels = 4 tokens * (14*3)^2 px: 8x8 upsizes to 84x84 -> 6x6 patches -> a 2x2 llm grid
+    (item,) = proc.process([Image.new("RGB", (8, 8))])
+    assert item.vit_grid == (6, 6) and item.llm_grid == (2, 2)
+    assert proc.prompt_replacement(item).full == [129264] * 8
+    with pytest.raises(ValueError, match="below the smallest"):
+        DeepseekV41MMProcessor(_dsv41_config(), "/nonexistent", MultimodalConfig(image_max_tokens=3))
+    (dummy,) = proc.dummy_items(torch.bfloat16, torch.device("cpu"))
+    dummy.validate()
+    assert dummy.feature.shape == (1, 3, 14, 14) and dummy.num_tokens == 4
+    assert proc.prompt_replacement(dummy).full == [129264] * 4
+
+
 def test_registry_resolves_by_architecture(monkeypatch):
     import freetoken.utils
     from freetoken.mm.processor import get_mm_processor
@@ -401,7 +443,9 @@ def test_registry_resolves_by_architecture(monkeypatch):
         "/glm": _glm_config(),
         "/muse": _muse_config(),
         "/minimax": _minimax_config(),
+        "/dsv41": _dsv41_config(),
         "/text-only": _hf_config(vision=False),
+        "/dsv41-text": _dsv41_config(vision=False),
         "/unknown-vlm": _hf_config(arch="SomeOtherForConditionalGeneration"),
     }
     monkeypatch.setattr(freetoken.utils, "cached_load_hf_config", lambda p: configs[p])
@@ -412,6 +456,8 @@ def test_registry_resolves_by_architecture(monkeypatch):
     assert isinstance(get_mm_processor("/glm"), Glm5NextMMProcessor)
     assert isinstance(get_mm_processor("/muse"), MuseGlimmerMMProcessor)
     assert isinstance(get_mm_processor("/minimax"), MiniMaxM3MMProcessor)
+    assert isinstance(get_mm_processor("/dsv41"), DeepseekV41MMProcessor)
     assert get_mm_processor("/text-only") is None
+    assert get_mm_processor("/dsv41-text") is None
     assert get_mm_processor("/unknown-vlm") is None
     assert get_mm_processor("/missing") is None  # a config that fails to load means no vision

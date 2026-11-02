@@ -5,7 +5,8 @@ from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
 from freetoken.attention.base import AttnType
 
 # State-dict key prefixes of the vision stack; load_weight drops them when the engine serves text-only.
-VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "vision_embedder.", "visual.")
+# DSV4.1's loader remaps its checkpoint's top-level "aligner."/"image_*" tensors under "vision.".
+VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "vision_embedder.", "visual.", "vision.")
 
 
 def detect_expert_quant(hf_config: Any) -> str:

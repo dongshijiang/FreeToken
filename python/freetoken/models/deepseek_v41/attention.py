@@ -208,9 +208,14 @@ class Attention(BaseOP):
             cmp_parts.append(self.attn.blocks_to_global(blocks, ratio, ti=ti))
 
         if self.is_index_source and ratio:
-            state.topk_indices = (
-                topk_parts[0] if len(topk_parts) == 1 else torch.cat(topk_parts, dim=1)
-            )
+            # picks are min(index_topk, that request's block count) wide, so a batch of
+            # short and long prompts needs the -1 pad (the kernel masks -1) before the cat
+            if len(topk_parts) == 1:
+                state.topk_indices = topk_parts[0]
+            else:
+                max_k = max(t.shape[-1] for t in topk_parts)
+                parts = [t if t.shape[-1] == max_k else F.pad(t, (0, max_k - t.shape[-1]), value=-1) for t in topk_parts]
+                state.topk_indices = torch.cat(parts, dim=1)
         if ratio:
             max_c = max(c.shape[-1] for c in cmp_parts)
             flat = []

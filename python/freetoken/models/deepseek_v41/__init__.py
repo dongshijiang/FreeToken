@@ -10,7 +10,7 @@ loaded.
 from .args import DeepseekV41Args, load_args
 from .config import parse_config
 from .model import DeepseekV41ForCausalLM
-from .weight import iter_expert_pieces, iter_weights
+from .weight import iter_expert_pieces, iter_vision_weights, iter_weights
 
 __all__ = [
     "DeepseekV41Args",
@@ -19,4 +19,5 @@ __all__ = [
     "DeepseekV41ForCausalLM",
     "iter_weights",
     "iter_expert_pieces",
+    "iter_vision_weights",
 ]

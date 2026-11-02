@@ -83,6 +83,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
         # routed_scaling_factor) are intentionally not set here.
         attn_sm_scale=args.head_dim**-0.5,
         dsv4_args=args,
+        # DeepseekV41VisionArgs, not None, flips ModelConfig.is_multimodal; a text-only
+        # release leaves both unset so the tower, processor and vision weights stay out.
+        vision_config=args.vision_args,
+        image_token_id=args.image_token_id,
         # Declares attn_type=DSV4 for the backend capability matrix (auto resolves to
         # dsv4_sparse, anything else is rejected at config time). Sizing stays on
         # dsv4_args; nothing generic prices this group.

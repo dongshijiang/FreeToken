@@ -17,6 +17,8 @@ Single-stream port of the CSA2 backbone wired onto FreeToken's shared paged engi
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn.functional as F
 
@@ -24,7 +26,13 @@ from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
 from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, RMSNorm, VocabParallelEmbedding
+from freetoken.mm import MM_PAD_SHIFT_VALUE
 from freetoken.models.blocks import BaseLLMModel
+
+if TYPE_CHECKING:
+    from freetoken.message import MMItem
+
+    from .vision import VisionTower
 
 from .args import DeepseekV41Args
 from .attention import Attention
@@ -90,16 +98,16 @@ class Block(BaseOP):
         )
         return y.view(shape)
 
-    def _engram_write(self, x, hashes):
+    def _engram_write(self, x, hashes, token_mask=None):
         if self.engram is not None and hashes is not None:
             # Two-step by contract: the host-sync table gather cannot fuse with the
             # gate's projection, and the lookup output feeds forward as plain bf16.
             emb = self.engram.lookup(hashes[:, :, self.engram_head_index])
-            return self.engram.forward(x, emb)
+            return self.engram.forward(x, emb, token_mask)
         return x
 
-    def prefill_batched(self, x, pre_mix, input_ids, segments, flat_positions, state, hashes=None):
-        x = self._engram_write(x, hashes)
+    def prefill_batched(self, x, pre_mix, input_ids, segments, flat_positions, state, hashes=None, token_mask=None):
+        x = self._engram_write(x, hashes, token_mask)
         residual = x
         pre, post, comb = self._hc_mix(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = self.attn_norm.forward(self._collapse(x, pre_mix))
@@ -113,8 +121,8 @@ class Block(BaseOP):
         x = self._expand(x, residual, post2, comb2)
         return x, pre2, state
 
-    def decode_step(self, x, pre_mix, pos, rows, cmp_stage_cap, input_ids, wctx, state, hashes=None):
-        x = self._engram_write(x, hashes)
+    def decode_step(self, x, pre_mix, pos, rows, cmp_stage_cap, input_ids, wctx, state, hashes=None, token_mask=None):
+        x = self._engram_write(x, hashes, token_mask)
         residual = x
         pre, post, comb = self._hc_mix(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = self.attn_norm.forward(self._collapse(x, pre_mix))
@@ -156,8 +164,25 @@ class Transformer(BaseOP):
         for layer in self.layers.op_list:
             layer.attn.bind(pool, device)
 
+    def _token_mask(self, input_ids: torch.Tensor) -> torch.Tensor | None:
+        """True on text rows; image rows carry content pad ids above MM_PAD_SHIFT_VALUE.
+        None on text-only releases (no image_token_id), which keep the exact prior behavior."""
+        if self.args.image_token_id is None:
+            return None
+        return input_ids < MM_PAD_SHIFT_VALUE
+
     def _embed_streams(self, input_ids: torch.Tensor):
-        h = self.embed.forward(input_ids.reshape(-1))
+        batch = get_global_ctx().batch
+        mm = batch.mm_embeds
+        ids = input_ids
+        if mm is not None:
+            # image rows carry content pad ids above the vocab: clamp for the lookup,
+            # the copy below overwrites them
+            ids = ids.clamp(max=self.embed.num_embeddings - 1)
+        h = self.embed.forward(ids.reshape(-1))
+        if mm is not None:
+            # whole-row replacement on the flat [seq, dim] embedding, like embed_input_ids
+            h.index_copy_(0, batch.mm_rows, mm[:, : self.args.dim].to(h.dtype))
         h = h.view(*input_ids.shape, self.args.dim).unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         # Incoming pre at the embedding: one-hot stream 0 (fp32, the collapse's mixer).
         pre = h.new_zeros(*input_ids.shape, self.hc_mult, dtype=torch.float32)
@@ -166,11 +191,13 @@ class Transformer(BaseOP):
 
     def prefill_batched(self, input_ids: torch.Tensor, segments, flat_positions: torch.Tensor) -> torch.Tensor:
         # Ragged batched prefill (bs >= 1); see V4's Transformer for the addressing contract.
-        h, pre = self._embed_streams(input_ids.view(1, -1))
+        ids = input_ids.view(1, -1)
+        h, pre = self._embed_streams(ids)
         state = CSA2State()
-        hashes = self.engram_hash(input_ids.view(1, -1)) if self.engram_hash is not None else None
+        token_mask = self._token_mask(ids)
+        hashes = self.engram_hash(ids, token_mask) if self.engram_hash is not None else None
         for layer in self.layers.op_list:
-            h, pre, state = layer.prefill_batched(h, pre, input_ids, segments, flat_positions, state, hashes)
+            h, pre, state = layer.prefill_batched(h, pre, input_ids, segments, flat_positions, state, hashes, token_mask)
         # No hc_head: the final streams collapse with the last site's pre.
         M = h.size(1)
         collapsed = hc_pre_combine(
@@ -186,11 +213,12 @@ class Transformer(BaseOP):
         rows = torch.arange(B, device=input_ids.device)
         h, pre = self._embed_streams(input_ids)
         state = CSA2State()
-        hashes = self.engram_hash(input_ids) if self.engram_hash is not None else None
+        token_mask = self._token_mask(input_ids)
+        hashes = self.engram_hash(input_ids, token_mask) if self.engram_hash is not None else None
         # Layer-invariant window-ring slots hoisted once (see V4's decode contract).
         wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
         for layer in self.layers.op_list:
-            h, pre, state = layer.decode_step(h, pre, pos, rows, cmp_stage_cap, input_ids, wctx, state, hashes)
+            h, pre, state = layer.decode_step(h, pre, pos, rows, cmp_stage_cap, input_ids, wctx, state, hashes, token_mask)
         collapsed = hc_pre_combine(
             h.view(B, self.hc_mult, self.args.dim), pre.view(B, self.hc_mult), h.dtype
         )
@@ -199,7 +227,19 @@ class Transformer(BaseOP):
         return self.head.forward(h)
 
 
-class DeepseekV41ForCausalLM(BaseLLMModel):
+class DeepseekV41VisionMixin:
+    """The engine hooks of a wrapper that owns the V4.1 vision tower as ``self.vision``."""
+
+    vision: VisionTower
+
+    def place_encoder_weights(self, mode: str) -> None:
+        self.vision.place_weights(mode)
+
+    def encode(self, item: MMItem) -> torch.Tensor:
+        return self.vision.encode(item)
+
+
+class DeepseekV41ForCausalLM(DeepseekV41VisionMixin, BaseLLMModel):
     """Engine adapter: a registered :class:`BaseLLMModel` wrapping the V4.1 transformer.
 
     KV pools, rope constants and compressor state are bound on the first forward.
@@ -209,6 +249,13 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         self._config = config
         self._args: DeepseekV41Args = config.dsv4_args
         self.model = Transformer(self._args, config.quant, strategy=config.moe_strategy, decode_target=config.decode_target, prefix="model")
+        # Built only when the checkpoint ships a vision section; encode() and
+        # place_encoder_weights() come from the mixin.
+        self.vision = None
+        if self._args.vision_args is not None:
+            from .vision import VisionTower
+
+            self.vision = VisionTower(self._args.vision_args, self._args.dim)
         # Engram lookup syncs to the host (CPU-resident tables): decode CUDA graphs
         # must stay off, the engine reads this flag before building its GraphRunner.
         self.needs_eager_decode = bool(self._args.engram_layer_ids)
