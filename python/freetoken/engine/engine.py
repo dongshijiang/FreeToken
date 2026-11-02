@@ -748,7 +748,10 @@ class Engine:
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
-        cache.collect_stats = config.moe_collect_stats
+        cache.collect_stats = config.moe_collect_stats or os.getenv("FREETOKEN_LRU_STATS", "0") == "1"
+        dump_path = os.getenv("FREETOKEN_STATS_DUMP")
+        if dump_path and get_tp_info().rank == 0:
+            self._register_moe_stats_dump(cache, dump_path)
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):
@@ -756,6 +759,27 @@ class Engine:
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
         return cache
+
+    def _register_moe_stats_dump(self, cache, dump_path: str) -> None:
+        """Measurement-only: dump the opt-in MoE decode stats when a trigger file
+        appears (<dump_path>.trigger). Runs as a daemon thread in the rank-0 engine
+        worker -- the API master process has no handler, so signals cannot reach it."""
+        import threading
+        import time as _time
+
+        trigger = dump_path + ".trigger"
+
+        def _poll():
+            while True:
+                try:
+                    if os.path.exists(trigger):
+                        os.remove(trigger)
+                        cache.dump_moe_stats(dump_path)
+                except Exception as e:
+                    logger.warning(f"moe stats dump failed: {e}")
+                _time.sleep(1.0)
+
+        threading.Thread(target=_poll, daemon=True, name="moe-stats-dump").start()
 
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
         """Resolve --moe-hybrid-max-fetch -1 (auto) into a bandwidth-matched fetch fraction.

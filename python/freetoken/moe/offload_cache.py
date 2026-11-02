@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 from dataclasses import dataclass
@@ -245,10 +246,22 @@ class OffloadMoeCache:
         # analysis. Accumulated in ``ensure_experts`` from the raw expert ids before the
         # kernel rewrites them to slots. Only accurate with CUDA graphs disabled (the
         # captured graph would not re-run this host-side scatter on replay).
-        self.collect_decode_freq = False
+        self.collect_decode_freq = os.getenv("FREETOKEN_DECODE_FREQ", "0") == "1"
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
+        # Opt-in per-step union counters (FREETOKEN_DECODE_UNION=1): unique experts per
+        # (layer, decode step) vs the raw per-token sum, the dedup-potential metric.
+        # Graph-safe: same on-device accumulation pattern as lru_stats.
+        self.collect_union = os.getenv("FREETOKEN_DECODE_UNION", "0") == "1"
+        if self.collect_union:
+            self._union_ind = torch.zeros(
+                (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
+            )
+            self._union_ones = torch.ones(self.num_experts, dtype=torch.int64, device=self.device)
+            self.union_stats = torch.zeros(
+                (self.num_layers, 3), dtype=torch.int64, device=self.device
+            )
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # bank_views) iterates this list, so the slot cache is bank-count agnostic.
@@ -520,6 +533,9 @@ class OffloadMoeCache:
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
         self.decode_freq.zero_()
+        if self.collect_union:
+            self._union_ind.zero_()
+            self.union_stats.zero_()
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
@@ -848,6 +864,14 @@ class OffloadMoeCache:
             # slot ids in place), so snapshot the routing histogram before that happens.
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        if self.collect_union:
+            ids = expert_ids.reshape(-1).long()
+            ind = self._union_ind[layer_id]
+            ind.zero_()
+            ind.scatter_add_(0, ids, self._union_ones[: ids.numel()])
+            self.union_stats[layer_id, 0] += (ind > 0).sum()
+            self.union_stats[layer_id, 1] += ids.numel()
+            self.union_stats[layer_id, 2] += 1
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
@@ -867,6 +891,14 @@ class OffloadMoeCache:
         if self.collect_decode_freq:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        if self.collect_union:
+            ids = expert_ids.reshape(-1).long()
+            ind = self._union_ind[layer_id]
+            ind.zero_()
+            ind.scatter_add_(0, ids, self._union_ones[: ids.numel()])
+            self.union_stats[layer_id, 0] += (ind > 0).sum()
+            self.union_stats[layer_id, 1] += ids.numel()
+            self.union_stats[layer_id, 2] += 1
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts_hybrid(
@@ -1007,6 +1039,41 @@ class OffloadMoeCache:
             "oracle_hit_at_slots": oracle_hit,
             "norm_entropy": norm_ent,
         }
+
+    def dump_moe_stats(self, path: str) -> None:
+        """Measurement-only snapshot of the opt-in decode stats to a JSON file.
+
+        Collected when FREETOKEN_LRU_STATS / FREETOKEN_DECODE_UNION /
+        FREETOKEN_DECODE_FREQ are set (see __init__); triggered by the rank-0
+        watchdog when <path>.trigger appears (see engine._register_moe_stats_dump).
+        Never raises into the caller."""
+        payload = {
+            "num_layers": self.num_layers,
+            "num_experts": self.num_experts,
+            "cache_size": self.cache_size,
+            "decode_target": self.decode_target,
+            "decode_miss": self.decode_miss_stats(),
+            "per_layer": self.decode_miss_stats_per_layer()["per_layer"],
+        }
+        if self.collect_decode_freq:
+            payload["routing"] = self.decode_routing_stats()
+            payload["decode_freq"] = self.decode_freq.tolist()
+        if self.collect_union:
+            payload["union_per_layer"] = [
+                {
+                    "layer": i,
+                    "steps": int(s[2]),
+                    "unique_per_step": (s[0] / s[2]) if s[2] else 0.0,
+                    "total_per_step": (s[1] / s[2]) if s[2] else 0.0,
+                    "dedup_ratio": (s[1] / s[0]) if s[0] else 0.0,
+                }
+                for i, s in enumerate(self.union_stats.tolist())
+            ]
+        tmp = f"{path}.tmp{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+        logger.info("moe stats dumped to %s", path)
 
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
