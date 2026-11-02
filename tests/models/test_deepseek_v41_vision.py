@@ -7,7 +7,12 @@ import torch
 
 from freetoken.message import MMItem
 from freetoken.models.deepseek_v41.args import DeepseekV41VisionArgs, load_vision_args
-from freetoken.models.deepseek_v41.vision import VisionTower
+from freetoken.models.deepseek_v41.vision import (
+    VisionAttention,
+    VisionTower,
+    _apply_vision_rotary,
+    _vision_cos_sin,
+)
 
 _cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -92,3 +97,43 @@ def test_load_vision_args_drops_unknown_keys():
     va = load_vision_args({"hidden_size": 64, "num_attention_heads": 4, "torch_dtype": "bfloat16", "unused": 1})
     assert va.hidden_size == 64 and va.num_attention_heads == 4
     assert va.num_hidden_layers == 32 and va.patch_size == 14  # released defaults for the omitted fields
+
+
+def test_vision_attention_matches_the_math_reference():
+    # the 4D SDPA input keeps the fused kernels eligible; this pins its numbers to
+    # an explicit softmax(QK^T/sqrt(d))V reference
+    torch.manual_seed(3)
+    va = _tiny_args()
+    attn = VisionAttention(va)
+    for t in attn.state_dict().values():
+        t.normal_(0, 0.05)
+    n, h, d = 12, va.num_attention_heads, va.head_dim
+    x = torch.randn(n, va.hidden_size, dtype=torch.bfloat16)
+    cos, sin = _vision_cos_sin(3, 4, va.hidden_size // h // 2, va.rope_theta, x.device)
+    out = attn.forward(x, cos, sin)
+
+    q, k, v = (t.view(n, h, d).float() for t in attn.wqkv.forward(x).chunk(3, dim=-1))
+    q = _apply_vision_rotary(q, cos, sin).float()
+    k = _apply_vision_rotary(k, cos, sin).float()
+    att = torch.einsum("qhd,khd->hqk", q, k) * d ** -0.5
+    ref = torch.einsum("hqk,khd->qhd", att.softmax(-1), v).reshape(n, -1)
+    ref = attn.wo.forward(ref.to(torch.bfloat16))
+    assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+
+@_cuda
+def test_large_grid_forward_stays_flash_and_finite():
+    # a real large image (released towers see grids well past 4000 patches) must ride
+    # the fused 4D attention, not fall back to a materialized N^2 math matrix
+    tower = _build(_tiny_args())
+    n_h, n_w = 54, 76  # 4104 patches > 4000
+    item = _item(n_h, n_w, n_h // 2, n_w // 2)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    span = tower.encode(item)
+    torch.cuda.synchronize()
+    assert span.shape == (2 + (n_h // 2) * (n_w // 2 + 1), 48)
+    assert torch.isfinite(span.float()).all()
+    # one N^2 matrix for the 4 heads alone would be ~135 MB; the fused path needs none
+    n2_bytes = 4 * n_h * n_w * n_h * n_w * span.element_size()
+    assert torch.cuda.max_memory_allocated() < n2_bytes // 2
