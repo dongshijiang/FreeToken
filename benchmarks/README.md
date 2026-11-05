@@ -27,5 +27,13 @@ batch size x miss rate.
 python benchmarks/bench_offload_cache_copy.py
 ```
 
+**`bench_numa_bw.py`** — host bandwidth split by NUMA node: PCIe H2D/D2H, same-NUMA
+and cross-NUMA DRAM read. Linux-only (sysfs topology + `sched_setaffinity`); turn off
+`kernel.numa_balancing` first or page migration will flatter the cross-NUMA number.
+
+```bash
+python benchmarks/bench_numa_bw.py --gpu 0
+```
+
 For host RAM vs PCIe bandwidth and the offload/hybrid backend pick, use `ft bench bw`
 instead — it writes the JSON profile the engine reads.
