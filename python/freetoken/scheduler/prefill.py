@@ -134,9 +134,12 @@ class PrefillAdder:
 
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
             self.last_fail = "kv_pages"
-            # The restore (if any) pinned its pages on this handle; dropping the handle without
-            # unlocking would leak the pin and stall those pages forever.
-            self.cache_manager.unlock(handle)
+            # Only a restore-pinned handle carries a lock here: the plain GPU-match handle
+            # stays unlocked until the lock() below, and dec_lock on an unlocked node would
+            # drive ref_count negative (and release a foreign pin). Dropping a pinned handle
+            # without unlocking would leak the pin and stall those pages forever.
+            if getattr(handle, "restore_locked", False):
+                self.cache_manager.unlock(handle)
             return None
         self.cache_manager.lock(handle)
         if estimated_size + self.reserved_size > self.cache_manager.available_size:

@@ -538,3 +538,61 @@ def test_dsv4_prefix_tier_disk_quota_evicts_prefix(tmp_path):
         for seq in range(4)
     )
     assert matched == 3
+
+
+
+def test_admission_gate_failure_skips_unlock_on_plain_match(tmp_path):
+    """Regression: the kv_pages admission gate used to unlock the matched handle even when
+    the restore had been declined by the tier capacity gate, leaving a plain GPU-match
+    handle nobody locked. dec_lock then drove the matched node's ref_count negative and
+    took the scheduler down (seen live as a TP0/TP1 crash on the L8192xC8 cell)."""
+    from types import SimpleNamespace
+
+    from freetoken.core import Req, SamplingParams
+    from freetoken.scheduler.cache import CacheManager
+    from freetoken.scheduler.prefill import PrefillAdder
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    pool = _pool()
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=2, disk_dir=tmp_path / "host")
+    pt = torch.zeros(4, 4 * P, dtype=torch.int32)
+    cm = CacheManager(
+        num_pages=3, page_size=P, page_table=pt, type="swa_radix",
+        swa_pool=pool, sliding_window_size=P, host_prefix_cache=tier,
+    )
+
+    ids = list(range(1000, 1000 + 2 * P + 1))
+    pending_ns = SimpleNamespace(input_ids=torch.tensor(ids, dtype=torch.int32), input_len=len(ids))
+
+    # Seed the tier with the 2-page prefix, then hand every page back.
+    seed_handle = cm.match_req(pending_ns).cuda_handle
+    seed_req = Req(
+        input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=0, cached_len=0,
+        output_len=0, uid=0, sampling_params=SamplingParams(), cache_handle=seed_handle,
+    )
+    seed_req.device_len = len(ids)
+    cm.lock(seed_handle)
+    cm.allocate_paged([seed_req])
+    seed_req.cached_len = len(ids)
+    with cm.lazy_free_region():
+        cm.cache_req(seed_req, finished=False)
+    cm.unlock(seed_req.cache_handle)
+    evicted = cm.prefix_cache.evict_full(len(ids))
+    cm._free_swa(evicted.swa_indices)
+    cm._free(evicted.kv_indices)
+
+    # Leave a one-page GPU match live (non-root node, unlocked, ref 0) so the next match
+    # returns a handle that looks partially cached: the restore capacity gate then declines
+    # (256 restore + 1 tail > 128 free) and hands back that unlocked handle.
+    head_loc = cm._page_to_token(cm._allocate(1))
+    cm.prefix_cache.insert(torch.tensor(ids[:P], dtype=torch.int32), head_loc)
+
+    tm = TableManager(max_running_reqs=4, page_table=pt)
+    # reserved_size stands in for the sibling admissions of the same pass: with it the
+    # FIRST gate (kv_pages, before any lock) refuses, which is the crashing call site.
+    adder = PrefillAdder(token_budget=4096, reserved_size=P, cache_manager=cm, table_manager=tm)
+    pending = PendingReq(0, torch.tensor(ids, dtype=torch.int32), SamplingParams(max_tokens=1))
+    assert adder.try_add_one(pending) is None
+    assert adder.last_fail == "kv_pages"
+    assert cm.prefix_cache.full_protected == 0
