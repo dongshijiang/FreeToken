@@ -648,18 +648,24 @@ class DSV4PagedKVCache(BaseKVCachePool):
         assert bool(torch.equal(fi, base + torch.arange(P, device=self._device))), (
             "DSV4 HiCache restore pages must be contiguous full-token pages"
         )
-        assert self.full_to_window[base].item() >= 0, "restore page is not bound to a window page"
         window_slot = int(self.full_to_window[base].item())
-        assert window_slot % P == 0
+        bound = window_slot >= 0
+        if bound:
+            assert window_slot % P == 0
 
         window = payload.get("window")
-        for layer_id in range(self._n_layers):
-            if window is not None:
-                self.window_pool[layer_id][window_slot:window_slot + P].copy_(
-                    window[layer_id].to(device=self._device, dtype=self._dtype)
-                )
-            else:
-                self.window_pool[layer_id][window_slot:window_slot + P].zero_()
+        # An unbound page is restored compressed-only: its raw window KV no longer exists
+        # (the snapshot stores None) and the SWA tree tombstones the page right after the
+        # insert. Rings are page-block addressed through the window slot -> skipped too.
+        assert window is None or bound, "window payload without a bound swa slot"
+        if bound:
+            for layer_id in range(self._n_layers):
+                if window is not None:
+                    self.window_pool[layer_id][window_slot:window_slot + P].copy_(
+                        window[layer_id].to(device=self._device, dtype=self._dtype)
+                    )
+                else:
+                    self.window_pool[layer_id][window_slot:window_slot + P].zero_()
 
         for layer_id, ratio in enumerate(self.compress_ratios):
             if not ratio:
@@ -678,7 +684,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
             for tier, attr in (("attn", "state_ring"), ("idx", "indexer_state_ring")):
                 ring = getattr(self, attr)[layer_id]
                 block = rings.get(tier)
-                if ring is None or block is None:
+                if ring is None or block is None or not bound:
                     continue
                 ring_page = window_slot // P
                 block_base = ring_page * ring.ring_size

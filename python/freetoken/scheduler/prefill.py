@@ -134,6 +134,9 @@ class PrefillAdder:
 
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
             self.last_fail = "kv_pages"
+            # The restore (if any) pinned its pages on this handle; dropping the handle without
+            # unlocking would leak the pin and stall those pages forever.
+            self.cache_manager.unlock(handle)
             return None
         self.cache_manager.lock(handle)
         if estimated_size + self.reserved_size > self.cache_manager.available_size:

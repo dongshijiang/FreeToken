@@ -36,6 +36,16 @@ class DSV4PrefixTierStats:
     put_pages: int = 0
     restore_pages: int = 0
     restore_failures: int = 0
+    # Request-level hit-rate counters: eligible = GPU miss with a longer host prefix,
+    # requests = eligible requests whose restore was published into the GPU tree.
+    restore_eligible: int = 0
+    restore_requests: int = 0
+    restore_tokens: int = 0
+    restore_eligible_tokens: int = 0
+    # Re-restores of an already-counted request (its restored pages were reclaimed
+    # by concurrent restores and it fell back to host again). Real extra work,
+    # excluded from the hit-rate numerator so it stays <= eligible.
+    restore_repeats: int = 0
     disk_writes: int = 0
     disk_reads: int = 0
     evicted_pages: int = 0
@@ -205,6 +215,33 @@ class DSV4PrefixTier:
                 if self._page_has_window(page_id):
                     last_good = page_idx
             return (last_good + 1) * self.page_size if last_good >= 0 else 0
+        finally:
+            self.index.lock_handle(handle, unlock=True)
+
+    def window_page_positions(self, token_ids: torch.Tensor, target: int) -> list[int]:
+        """Positions (0-based, page units) of pages within [0, target) whose snapshot still
+        carries window KV.
+
+        Restore binds a swa slot only for these pages: head snapshots store window=None
+        (the raw KV was discarded when it slid out of the window), so the swa-slot demand
+        is the trailing live window, a small constant, not the restore depth.
+        """
+        if target <= 0:
+            return []
+        ids = self._cpu(token_ids)[:target]
+        handle = self.index.match_prefix(ids).cuda_handle
+        matched = min(int(handle.cached_len), target)
+        if matched == 0:
+            return []
+        self.index.lock_handle(handle)
+        try:
+            rows = handle.get_matched_indices()
+            out = []
+            for page_idx, lo in enumerate(range(0, matched, self.page_size)):
+                page_id = int(rows[lo].item()) // self.page_size
+                if self._page_has_window(page_id):
+                    out.append(page_idx)
+            return out
         finally:
             self.index.lock_handle(handle, unlock=True)
 

@@ -72,6 +72,12 @@ class CacheManager:
         self.page_table = page_table
         self.page_size = page_size
         self.cache_type = type
+        # Global KV hit-rate counters (GPU radix + host restore combined). Counted once
+        # per request at its first match_req, before that request's own prefill writes
+        # start matching back, so cached_tokens never includes self-prefill.
+        self.kv_stat_requests = 0
+        self.kv_stat_prompt_tokens = 0
+        self.kv_stat_cached_tokens = 0
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -102,6 +108,28 @@ class CacheManager:
         return create_prefix_cache(device=device, type=type, page_size=page_size)
 
     def match_req(self, req: PendingReq) -> MatchResult:
+        # Chunked prefill re-matches on every step; count the hit rate once per request,
+        # at the first match, so later chunks matching their own prefill pages don't
+        # inflate cached_tokens.
+        result = self._match_req(req)
+        if getattr(req, "_kv_stat_counted", False) is False:
+            req._kv_stat_counted = True
+            self.kv_stat_requests += 1
+            self.kv_stat_prompt_tokens += int(req.input_len) - 1
+            self.kv_stat_cached_tokens += int(result.cuda_handle.cached_len)
+        return result
+
+    def kv_stat_snapshot(self) -> dict:
+        total = self.kv_stat_prompt_tokens
+        rate = 100.0 * self.kv_stat_cached_tokens / total if total else 0.0
+        return {
+            "requests": self.kv_stat_requests,
+            "prompt_tokens": total,
+            "cached_tokens": self.kv_stat_cached_tokens,
+            "hit_rate_pct": round(rate, 2),
+        }
+
+    def _match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
         ids = req.input_ids[: input_len - 1]
@@ -317,6 +345,10 @@ class CacheManager:
 
     def lock(self, handle: BaseCacheHandle) -> None:
         if self.is_swa:
+            # _restore_dsv4_host_prefix pins the restored pages at publish time; the flag makes
+            # the later admission lock a no-op so ref/swa counts stay paired with unlock.
+            if getattr(handle, "restore_locked", False):
+                return
             # records the window boundary on the (frozen) handle for unlock/dec_lock.
             object.__setattr__(handle, "swa_uuid", self.prefix_cache.inc_lock(handle.node))
         elif self.is_hybrid:
@@ -326,6 +358,9 @@ class CacheManager:
 
     def unlock(self, handle: BaseCacheHandle) -> None:
         if self.is_swa:
+            # Symmetric with the lock-side flag: exactly one dec per restore pin.
+            if getattr(handle, "restore_locked", False):
+                object.__setattr__(handle, "restore_locked", False)
             self.prefix_cache.dec_lock(handle.node, handle.swa_uuid)
         elif self.is_hybrid:
             self.prefix_cache.dec_lock(handle.node)
@@ -373,10 +408,15 @@ class CacheManager:
     def _restore_dsv4_host_prefix(self, req, handle):
         """Restore a DSV4 host prefix and publish it through the live SWA radix tree.
 
-        This first version restores the full host-matched prefix (not only the delta after
-        the GPU match). That keeps interaction with SWA tombstone revival simple: every
-        restored page is freshly bound, old pages beyond the sliding window are tombstoned
-        at insert, and the tail page remains live for compressor carry-by-value.
+        The full host-matched prefix is restored into the full pool (compressed/indexer/ring
+        state for every page), but only the snapshots that still carry window KV -- the
+        trailing live window, a small constant -- get a swa-pool slot. Head snapshots store
+        window=None (their raw KV was discarded when it slid out of the window), so binding
+        a slot per restored page would demand the whole prefix from a pool sized for the
+        concurrent window working set and silently kill every long-prompt restore. Head
+        pages are restored compressed-only, inserted live to keep the SWA match rule from
+        truncating the handle to the live tail, and tombstoned right after by
+        trim_head_swa (free_swa is idempotent over the unbound head slots).
         """
         from freetoken.kvcache.swa_radix_cache import SWACacheHandle
         from freetoken.utils import align_down
@@ -390,6 +430,13 @@ class CacheManager:
             target = min(host.restorable_len(ids), align_down(len(ids), P))
             if target <= int(handle.cached_len):
                 return handle
+            # Chunked prefill re-matches on every step; count each request once so the
+            # eligible denominator stays per-request (retries within one request must
+            # not inflate it under swa-slot pressure).
+            if not getattr(req, "_host_restore_counted", False):
+                host.stats.restore_eligible += 1
+                host.stats.restore_eligible_tokens += target - int(handle.cached_len)
+                req._host_restore_counted = True
             pages = target // P
             needed_tokens = pages * P
             # Lock the matched prefix before either allocator can reclaim it, then check
@@ -398,18 +445,32 @@ class CacheManager:
             allocated = full_locs = None
             published = False
             try:
-                if needed_tokens > self.available_size:
+                if needed_tokens + (req.input_len - target) > self.available_size:
+                    # The restore increment AND the prompt tail prefill must both fit. Restore-only
+                    # admission that later fails requeues the request unlocked, which re-exposes the
+                    # freshly published pages to the next admission's allocator -- the repeat-restore
+                    # churn under concurrent large prompts. Skipping the restore (host copies and all)
+                    # is strictly cheaper than restoring into a doomed admission.
                     return handle
                 allocated = self._allocate(pages)
                 order = torch.argsort(allocated)
                 full_locs = self._page_to_token(allocated[order])
-                if self.swa_pool.swa_available_size() < needed_tokens:
-                    self.ensure_swa_slots(needed_tokens)
-                if self.swa_pool.swa_available_size() < needed_tokens:
-                    self._free(full_locs)
-                    allocated = full_locs = None
-                    return handle
-                self.swa_pool.alloc_swa(full_locs)
+                win_pages = host.window_page_positions(ids, target)
+                swa_needed = len(win_pages) * P
+                if swa_needed:
+                    if self.swa_pool.swa_available_size() < swa_needed:
+                        self.ensure_swa_slots(swa_needed)
+                    if self.swa_pool.swa_available_size() < swa_needed:
+                        self._free(full_locs)
+                        allocated = full_locs = None
+                        return handle
+                    # Bind per contiguous run (alloc_swa requires ascending whole pages).
+                    run_start = prev = win_pages[0]
+                    for idx in win_pages[1:] + [-1]:
+                        if idx != prev + 1:
+                            self.swa_pool.alloc_swa(full_locs[run_start * P: (prev + 1) * P])
+                            run_start = idx
+                        prev = idx
                 restored = host.get(ids, full_locs)
                 if restored < target:
                     extra = full_locs[restored:]
@@ -433,7 +494,25 @@ class CacheManager:
                     self._free_swa(self.prefix_cache.trim_head_swa(
                         req.input_ids[:target], keep_from
                     ))
-                return SWACacheHandle(m.cached_len, m.node, m.kv_indices)
+                # Success counters are per-request too: a request whose restored pages
+                # were reclaimed by a concurrent restore re-enters this path and must
+                # not push the numerator above the eligible denominator. Re-runs are
+                # observed separately via restore_repeats.
+                if getattr(req, "_host_restore_success", False):
+                    host.stats.restore_repeats += 1
+                else:
+                    host.stats.restore_requests += 1
+                    host.stats.restore_tokens += restored
+                    req._host_restore_success = True
+                # Page ownership: the restored pages are this request's working set from the
+                # moment they land in the tree. Pin here -- not at admission -- so a concurrent
+                # admission's allocator (evict_full / ensure_swa_slots) cannot reclaim them
+                # through the unlocked leaf they briefly are otherwise. lock() is a no-op on
+                # the flagged handle and every admission failure path unlocks symmetrically.
+                new_handle = SWACacheHandle(m.cached_len, m.node, m.kv_indices)
+                self.lock(new_handle)
+                object.__setattr__(new_handle, "restore_locked", True)
+                return new_handle
             except Exception:
                 if not published and full_locs is not None:
                     self.swa_pool.free_swa(full_locs)
