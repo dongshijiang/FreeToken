@@ -151,8 +151,10 @@ def test_cache_manager_restores_dsv4_host_prefix(tmp_path):
     pool = _pool()
     tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=2, disk_dir=tmp_path / "host")
     pt = torch.zeros(4, 4 * P, dtype=torch.int32)
+    # 4 pages: the restore must clear the capacity gate with room for the prompt tail
+    # after the seeding cycle hands its pages back.
     cm = CacheManager(
-        num_pages=3, page_size=P, page_table=pt, type="swa_radix",
+        num_pages=4, page_size=P, page_table=pt, type="swa_radix",
         swa_pool=pool, sliding_window_size=P, host_prefix_cache=tier,
     )
 
@@ -325,18 +327,38 @@ def test_restore_pins_pages_against_concurrent_allocation(tmp_path):
     published pages through evict_full (unlocked leaves), forcing a repeat restore."""
     from types import SimpleNamespace
 
+    from freetoken.core import Req, SamplingParams
     from freetoken.scheduler.cache import CacheManager
 
     pool = _pool()
     tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=2, disk_dir=tmp_path / "host")
     pt = torch.zeros(4, 4 * P, dtype=torch.int32)
     cm = CacheManager(
-        num_pages=3, page_size=P, page_table=pt, type="swa_radix",
+        num_pages=4, page_size=P, page_table=pt, type="swa_radix",
         swa_pool=pool, sliding_window_size=P, host_prefix_cache=tier,
     )
 
     ids = list(range(1000, 1000 + 2 * P + 1))
     pending = SimpleNamespace(input_ids=torch.tensor(ids, dtype=torch.int32), input_len=len(ids))
+
+    # Seed the tier: one request cycle puts both pages into host, then everything is
+    # evicted from the GPU tree so the next match_req restores from host.
+    seed_handle = cm.match_req(pending).cuda_handle
+    seed_req = Req(
+        input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=0, cached_len=0,
+        output_len=0, uid=0, sampling_params=SamplingParams(), cache_handle=seed_handle,
+    )
+    seed_req.device_len = len(ids)
+    cm.lock(seed_handle)
+    cm.allocate_paged([seed_req])
+    seed_req.cached_len = len(ids)
+    with cm.lazy_free_region():
+        cm.cache_req(seed_req, finished=False)
+    cm.unlock(seed_req.cache_handle)
+    evicted = cm.prefix_cache.evict_full(len(ids))
+    cm._free_swa(evicted.swa_indices)
+    cm._free(evicted.kv_indices)
+
     handle = cm.match_req(pending).cuda_handle
     assert getattr(handle, "restore_locked", False)
     assert cm.prefix_cache.full_protected == 2 * P
@@ -366,19 +388,39 @@ def test_restore_skipped_when_prefill_tail_would_not_fit(tmp_path):
     dooms the admission, which then requeues unlocked and re-exposes the published pages."""
     from types import SimpleNamespace
 
+    from freetoken.core import Req, SamplingParams
     from freetoken.scheduler.cache import CacheManager
 
     pool = _pool()
     tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=2, disk_dir=tmp_path / "host")
     pt = torch.zeros(4, 4 * P, dtype=torch.int32)
-    # 2 free pages: the 2-page restore fits, but restore + 1-page prompt tail does not.
     cm = CacheManager(
-        num_pages=2, page_size=P, page_table=pt, type="swa_radix",
+        num_pages=3, page_size=P, page_table=pt, type="swa_radix",
         swa_pool=pool, sliding_window_size=P, host_prefix_cache=tier,
     )
 
     ids = list(range(1000, 1000 + 2 * P + 1))
     pending = SimpleNamespace(input_ids=torch.tensor(ids, dtype=torch.int32), input_len=len(ids))
+
+    # Seed the tier with the 2-page prefix, then hand every page back: after the evict
+    # exactly 2 pages are free -- the 2-page restore fits, but restore + 1-page prompt
+    # tail does not, so the gate must decline the restore entirely.
+    seed_handle = cm.match_req(pending).cuda_handle
+    seed_req = Req(
+        input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=0, cached_len=0,
+        output_len=0, uid=0, sampling_params=SamplingParams(), cache_handle=seed_handle,
+    )
+    seed_req.device_len = len(ids)
+    cm.lock(seed_handle)
+    cm.allocate_paged([seed_req])
+    seed_req.cached_len = len(ids)
+    with cm.lazy_free_region():
+        cm.cache_req(seed_req, finished=False)
+    cm.unlock(seed_req.cache_handle)
+    evicted = cm.prefix_cache.evict_full(len(ids))
+    cm._free_swa(evicted.swa_indices)
+    cm._free(evicted.kv_indices)
+
     handle = cm.match_req(pending).cuda_handle
     # Restore declined: no pages published, no pin, counters still record the attempt.
     assert handle.cached_len == 0
