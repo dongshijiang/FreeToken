@@ -47,6 +47,8 @@ class UserReply(BaseFrontendMsg):
     gpu_mem_bytes: int = 0
     # HiCache tier snapshot; None when disabled or not reported.
     hicache: Dict[str, int] | None = None
+    # Global KV hit-rate counters (GPU radix + host restore), one snapshot per status reply.
+    kv_cache: Dict[str, int] | None = None
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would

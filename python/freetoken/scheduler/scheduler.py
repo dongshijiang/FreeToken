@@ -481,6 +481,7 @@ class Scheduler(SchedulerIOMixin):
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
                 m.gpu_mem_bytes = mem
+                m.kv_cache = self.cache_manager.kv_stat_snapshot()
                 if self.cache_manager.host_prefix_cache is not None:
                     try:
                         m.hicache = self.cache_manager.host_prefix_cache.stats_snapshot()

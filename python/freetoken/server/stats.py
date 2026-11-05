@@ -38,6 +38,7 @@ class StatsTracker:
         self.swa_total_tokens = 0
         self.vram_bytes = 0
         self.hicache: dict[str, int] | None = None
+        self.kv_cache: dict[str, int] | None = None
 
     @property
     def active(self) -> int:
@@ -78,6 +79,9 @@ class StatsTracker:
         hicache = getattr(reply, "hicache", None)
         if hicache is not None:
             self.hicache = dict(hicache)
+        kv_cache = getattr(reply, "kv_cache", None)
+        if kv_cache is not None:
+            self.kv_cache = dict(kv_cache)
         if getattr(reply, "finished", False):
             uid = getattr(reply, "uid", None)
             if uid in self._inflight:
@@ -135,9 +139,10 @@ def _swa_page_size(config: Any) -> int:
 def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
     """Full /v1/stats doc. throughput is 0 when idle; kv/mamba/swa are null
     when their total is 0 (owned-KV / non-hybrid / non-SWA). kv and swa share one shape:
-    pages + the pool's own page_size (tokens = pages x page_size). gpus: the engine's GPU as
-    [{index, name, uuid, total_bytes}] (the primary rank's; a list so TP can extend it), []
-    until the readiness meta arrives."""
+    pages + the pool's own page_size (tokens = pages x page_size). kv_cache: global
+    prefix-cache hit-rate counters (GPU radix + host restore combined). gpus: the engine's
+    GPU as [{index, name, uuid, total_bytes}] (the primary rank's; a list so TP can extend
+    it), [] until the readiness meta arrives."""
     tr: StatsTracker = state.stats
     config = state.config
     ready_at = getattr(state, "ready_at", None)
@@ -166,6 +171,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "swa": swa,
         "vram_bytes": tr.vram_bytes,
         "hicache": tr.hicache,
+        "kv_cache": tr.kv_cache,
         "gpus": list(getattr(state, "gpus", None) or []),
         "throughput": {
             "decode_tps": round(tr.decode_tps(), 1),

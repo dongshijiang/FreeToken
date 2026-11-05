@@ -34,6 +34,7 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
+        moe_stats: str | None = None,
     ) -> None:
         if batch.is_prefill:
             self._report_prefill(
@@ -55,6 +56,7 @@ class SchedulerStatusReporter:
                 page_size=page_size,
                 mamba_slots=mamba_slots,
                 swa_tokens=swa_tokens,
+                moe_stats=moe_stats,
             )
 
     def _report_prefill(
@@ -101,6 +103,7 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
+        moe_stats: str | None = None,
     ) -> None:
         self._decode_forward_count += 1
         self._decode_generated_tokens += len(batch.reqs)
@@ -119,6 +122,7 @@ class SchedulerStatusReporter:
             f"token usage: {_usage_ratio(kv_used_pages, kv_total_pages):.2f}, "
             f"{_swa_msg(swa_tokens)}"
             f"{_mamba_msg(mamba_slots)}"
+            f"{_moe_msg(moe_stats)}"
             f"gen throughput (token/s): {gen_throughput:.2f}, "
             f"#queue-req: {queue_reqs}"
         )
@@ -142,3 +146,10 @@ def _swa_msg(swa_tokens: tuple[int, int] | None) -> str:
         return ""
     used, total = swa_tokens
     return f"#swa-token: {used}/{total}, swa usage: {_usage_ratio(used, total):.2f}, "
+
+
+def _moe_msg(moe_stats: str | None) -> str:
+    """Expert cache behavior for offload backends; empty unless stats collection is on."""
+    if not moe_stats:
+        return ""
+    return f"moe-stats: {moe_stats}, "

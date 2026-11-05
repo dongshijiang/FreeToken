@@ -50,6 +50,8 @@ class DetokenizeMsg(BaseTokenizerMsg):
     gpu_mem_bytes: int = 0
     # HiCache tier snapshot; None when disabled or not reported.
     hicache: Dict[str, int] | None = None
+    # Global KV hit-rate counters (GPU radix + host restore); None when not reported.
+    kv_cache: Dict[str, int] | None = None
 
 
 @dataclass
