@@ -125,6 +125,10 @@ class DSV4PrefixTier:
         self._prefetch_writes: dict[int, Future] = {}
         self._closed = False
         self._lock = threading.RLock()
+        # The engine drives the scheduler on a dedicated CUDA stream; the put writer
+        # thread's GPU reads must ride the SAME stream (wired by the scheduler), else
+        # they race the engine's in-flight pool writes on the default stream.
+        self.engine_stream: torch.cuda.Stream | None = None
         self._load_persisted_index()
 
     @property
@@ -331,7 +335,8 @@ class DSV4PrefixTier:
         aligned = align_down(len(ids), self.page_size)
         if aligned == 0:
             return 0
-        return self._put_sync(ids, full_locs, aligned)
+        locs = full_locs.detach().to("cpu", dtype=torch.int64).contiguous()
+        return self._put_sync(ids, locs, aligned)
 
     def put_async(self, token_ids: torch.Tensor, full_locs: torch.Tensor,
                   release: Callable[[], None] | None = None) -> int:
@@ -360,11 +365,14 @@ class DSV4PrefixTier:
             if release is not None:
                 release()
             return 0
+        # Freeze the source page locations on the CALLER's thread (the scheduler, on the
+        # engine stream): the writer gathers by VALUE from these CPU ints, so no
+        # cross-thread CUDA read of the page-table clone can race the engine stream.
+        locs = full_locs[:aligned].detach().to("cpu", dtype=torch.int64).contiguous()
         with self._lock:
             self._pending_puts += 1
         self._put_pool.submit(
-            self._put_job, ids[:aligned].clone(), full_locs[:aligned].detach().clone(),
-            generation, release,
+            self._put_job, ids[:aligned].clone(), locs, generation, release,
         )
         return aligned - matched
 
@@ -383,7 +391,13 @@ class DSV4PrefixTier:
         try:
             started = time.perf_counter()
             try:
-                self._put_sync(ids, full_locs, len(ids), generation)
+                if self.engine_stream is not None:
+                    # Gather on the engine's stream: orders these reads after every pool
+                    # write the scheduler had issued when the put was enqueued.
+                    with torch.cuda.stream(self.engine_stream):
+                        self._put_sync(ids, full_locs, len(ids), generation)
+                else:
+                    self._put_sync(ids, full_locs, len(ids), generation)
             finally:
                 self._record_latency("put", started)
         except Exception as exc:
@@ -424,7 +438,18 @@ class DSV4PrefixTier:
                     end = min(start + self.page_size, aligned)
                     if end - start != self.page_size:
                         break  # put is always page-aligned; ignore a malformed tail
-                    payload = self.pool.gather_prefix_page(full_locs[start:end])
+                    try:
+                        payload = self.pool.gather_prefix_page(full_locs[start:end])
+                    except AssertionError:
+                        seg = full_locs[start:end].tolist()
+                        base = seg[0]
+                        bad = [i for i, v in enumerate(seg) if v != base + i]
+                        logger.error(
+                            "DSV4 HiCache put non-contiguous page [%d,%d) matched=%d: "
+                            "base=%d first16=%s first_bad_off=%s",
+                            start, end, matched, base, seg[:16], bad[:4],
+                        )
+                        raise
                     payload["token_ids"] = ids[start:end].clone()
                     self._ensure_host_capacity(1)
                     page_id = self._allocate_page_ids(1)[0]
