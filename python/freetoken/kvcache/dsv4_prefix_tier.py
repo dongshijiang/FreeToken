@@ -20,6 +20,7 @@ from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import torch
 
@@ -75,6 +76,11 @@ class DSV4PrefixTier:
     """Host/disk backing store for page-aligned DSV4 prefix restore segments."""
 
     supports_dsv4 = True
+    supports_async = True
+    # Backpressure bound: above this many queued puts the caller falls back to a
+    # synchronous write-through. Each queued job pins its source GPU pages via the
+    # SWA tree, so the bound also caps how much eviction space a burst can hold back.
+    ASYNC_PUT_QUEUE_LIMIT = 4
 
     def __init__(self, pool, *, page_size: int, capacity_pages: int,
                  disk_dir: str | Path | None = None,
@@ -108,6 +114,11 @@ class DSV4PrefixTier:
         self._warned_restore_failure = False
         self._disk_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dsv4-prefix-tier")
         self._disk_writes: dict[int, Future] = {}
+        self._put_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dsv4-prefix-put")
+        self._pending_puts = 0
+        # Bumped by clear(); an in-flight put whose generation no longer matches is
+        # dropped instead of resurrecting stale pages into the fresh index.
+        self._generation = 0
         self._prefetch_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="dsv4-prefix-prefetch"
         )
@@ -164,6 +175,7 @@ class DSV4PrefixTier:
             "cached_pages": self.index.size_info.total_size // self.page_size,
             "host_pages": len(self.host_pages),
             "disk_pages": len(self.disk_pages),
+            "pending_puts": self._pending_puts,
             "capacity_pages": self.capacity_pages,
             "disk_capacity_pages": self.disk_capacity_pages,
         }
@@ -304,14 +316,95 @@ class DSV4PrefixTier:
         for future in futures:
             future.result()
 
+    @property
+    def pending_puts(self) -> int:
+        return self._pending_puts
+
+    @property
+    def saturated(self) -> bool:
+        return self._pending_puts >= self.ASYNC_PUT_QUEUE_LIMIT
+
     @_timed("put")
     def put(self, token_ids: torch.Tensor, full_locs: torch.Tensor) -> int:
+        """Synchronous write-through (the put_async backpressure fallback)."""
         ids = self._cpu(token_ids)
         aligned = align_down(len(ids), self.page_size)
         if aligned == 0:
             return 0
+        return self._put_sync(ids, full_locs, aligned)
+
+    def put_async(self, token_ids: torch.Tensor, full_locs: torch.Tensor,
+                  release: Callable[[], None] | None = None) -> int:
+        """Asynchronous write-through: enqueue the gather+store and return immediately.
+
+        The CALLER guarantees the source GPU slots stay un-evicted until the writer
+        gathers them (the CacheManager pins the committed tree path and drops the pin
+        via ``release``, which this tier invokes on the writer thread once the job has
+        run -- success or failure). Single-writer FIFO keeps overlapping puts consistent:
+        a later job's tier match always sees earlier jobs' inserts.
+        """
+        ids = self._cpu(token_ids)
+        aligned = align_down(len(ids), self.page_size)
+        if aligned == 0:
+            if release is not None:
+                release()
+            return 0
+        with self._lock:
+            if self._closed:
+                if release is not None:
+                    release()
+                return 0
+            matched = int(self.index.match_prefix(ids[:aligned]).cuda_handle.cached_len)
+            generation = self._generation
+        if matched >= aligned:
+            if release is not None:
+                release()
+            return 0
+        with self._lock:
+            self._pending_puts += 1
+        self._put_pool.submit(
+            self._put_job, ids[:aligned].clone(), full_locs[:aligned].detach().clone(),
+            generation, release,
+        )
+        return aligned - matched
+
+    def wait_puts(self) -> None:
+        """Block until every enqueued async put has been applied."""
+        with self._lock:
+            if self._closed:
+                return
+        try:
+            self._put_pool.submit(lambda: None).result()
+        except RuntimeError:
+            pass  # pool already shut down; close() drained it
+
+    def _put_job(self, ids: torch.Tensor, full_locs: torch.Tensor,
+                 generation: int, release: Callable[[], None] | None) -> None:
+        try:
+            started = time.perf_counter()
+            try:
+                self._put_sync(ids, full_locs, len(ids), generation)
+            finally:
+                self._record_latency("put", started)
+        except Exception as exc:
+            logger.warning("DSV4 HiCache async put failed: %r", exc)
+        finally:
+            with self._lock:
+                self._pending_puts -= 1
+            if release is not None:
+                try:
+                    release()
+                except Exception as exc:
+                    logger.warning("DSV4 HiCache put release failed: %r", exc)
+
+    def _put_sync(self, ids: torch.Tensor, full_locs: torch.Tensor, aligned: int,
+                  generation: int | None = None) -> int:
         if len(full_locs) < aligned:
             raise ValueError("DSV4 prefix tier put got fewer full locs than token ids")
+        if generation is not None:
+            with self._lock:
+                if generation != self._generation:
+                    return 0  # the tier was cleared while this job waited; drop it
         self.stats.put_requests += 1
         with self._lock:
             match = self.index.match_prefix(ids[:aligned])
@@ -396,6 +489,7 @@ class DSV4PrefixTier:
 
     def clear(self) -> None:
         with self._lock:
+            self._generation += 1
             self.index = RadixPrefixCache(torch.device("cpu"), page_size=self.page_size)
             for page_id in list(self.host_pages):
                 self._drop_page(page_id)
@@ -407,6 +501,7 @@ class DSV4PrefixTier:
             self.next_page_id = 0
 
     def flush(self) -> None:
+        self.wait_puts()
         with self._lock:
             for future in list(self._prefetch_writes.values()):
                 future.result()
@@ -417,6 +512,12 @@ class DSV4PrefixTier:
 
     def close(self) -> None:
         self._closed = True
+        # Drain in-flight async puts first: their pages must land in host_pages (and
+        # their pins release) before the spill pass below snapshots host contents.
+        try:
+            self._put_pool.shutdown(wait=True)
+        except RuntimeError:
+            pass
         # Drain prefetches first: a worker may still insert a page after the loop below.
         with self._lock:
             futures = list(self._prefetch_writes.values())

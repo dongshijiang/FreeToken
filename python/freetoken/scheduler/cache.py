@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections import deque
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -78,6 +79,27 @@ class CacheManager:
         self.kv_stat_requests = 0
         self.kv_stat_prompt_tokens = 0
         self.kv_stat_cached_tokens = 0
+        # Async host write-through: the tier's writer thread appends (tree, node, swa_uuid)
+        # here once a put's gather finished; the SCHEDULER thread applies the dec_lock
+        # (the radix tree is otherwise single-threaded) at the drain points below.
+        self._host_releases: deque = deque()
+
+    def _drain_host_releases(self) -> None:
+        """Apply tree-pin releases the async host put writer has finished."""
+        releases = self._host_releases
+        while releases:
+            tree, node, swa_uuid = releases.popleft()
+            try:
+                tree.dec_lock(node, swa_uuid)
+            except Exception as exc:
+                logger.warning("host put pin release failed: %r", exc)
+
+    def flush_host_puts(self) -> None:
+        """Apply every pending async host put and release its tree pin."""
+        host = self.host_prefix_cache
+        if host is not None and getattr(host, "supports_async", False):
+            host.wait_puts()
+        self._drain_host_releases()
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -111,6 +133,8 @@ class CacheManager:
         # Chunked prefill re-matches on every step; count the hit rate once per request,
         # at the first match, so later chunks matching their own prefill pages don't
         # inflate cached_tokens.
+        if self._host_releases:
+            self._drain_host_releases()
         result = self._match_req(req)
         if getattr(req, "_kv_stat_counted", False) is False:
             req._kv_stat_counted = True
@@ -747,17 +771,68 @@ class CacheManager:
         self._put_dsv4_host_prefix(req, insert_len=insert_len)
 
     def _put_dsv4_host_prefix(self, req: Req, *, insert_len: int) -> None:
-        """Write complete DSV4 pages to the dedicated HiCache tier after SWA commit."""
+        """Write complete DSV4 pages to the dedicated HiCache tier after SWA commit.
+
+        Async write-through: pin the committed tree path so the freshly inserted GPU
+        slots stay un-evicted until the tier's writer gathers them, enqueue the put,
+        and return immediately -- the writer drops the pin through the release queue
+        the scheduler drains. Falls back to a synchronous put when the writer is
+        saturated or the tree cannot be pinned at the full insert boundary.
+        """
+        self._drain_host_releases()
         host = self.host_prefix_cache
         if host is None or not getattr(host, "supports_dsv4", False) or insert_len <= 0:
             return
         try:
+            if (
+                getattr(host, "supports_async", False)
+                and not host.saturated
+                and self._enqueue_async_host_put(req, insert_len)
+            ):
+                return
             host.put(
                 req.input_ids[:insert_len],
                 self.page_table[req.table_idx, :insert_len].clone(),
             )
         except Exception as exc:
             logger.warning("DSV4 host prefix write failed: %r", exc)
+
+    def _enqueue_async_host_put(self, req: Req, insert_len: int) -> bool:
+        """Pin the just-committed SWA path and hand the put to the tier's writer thread.
+
+        The pin (inc_lock node..root + trailing-window swa ref) keeps every source slot
+        un-evicted and un-tombstoned while the background gather reads them; evict,
+        evict_swa and trim_head_swa all skip locked nodes, and insert's revive path
+        explicitly preserves the slots of a full-locked reader. Returns False (nothing
+        enqueued, no pin taken) when the tree does not reach the full insert boundary;
+        the caller then falls back to a synchronous put."""
+        host = self.host_prefix_cache
+        tree = self.prefix_cache
+        if not hasattr(tree, "match_prefix_full"):
+            return False
+        node, matched = tree.match_prefix_full(req.input_ids[:insert_len])
+        if matched != insert_len:
+            return False
+        swa_uuid = tree.inc_lock(node)
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            self._host_releases.append((tree, node, swa_uuid))
+
+        try:
+            host.put_async(
+                req.input_ids[:insert_len],
+                self.page_table[req.table_idx, :insert_len].clone(),
+                release=release,
+            )
+        except Exception:
+            release()  # never leak the pin, even when the enqueue itself fails
+            raise
+        return True
 
     def _padded_tail(self, req: Req, start: int) -> torch.Tensor:
         """The request's OWN slice [start, page_ceil(cached_len)) of the page table. A finish

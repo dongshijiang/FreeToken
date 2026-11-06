@@ -182,6 +182,7 @@ def test_cache_manager_restores_dsv4_host_prefix(tmp_path):
     expected_window = pool.window_pool[0][window_slots.long()].cpu().clone()
     with cm.lazy_free_region():
         cm.cache_req(req, finished=False)
+    cm.flush_host_puts()  # async write-through: apply the queued put before poisoning
 
     # Force both pages out of the GPU SWA tree, then poison every live pool buffer.
     cm.unlock(req.cache_handle)
@@ -354,6 +355,7 @@ def test_restore_pins_pages_against_concurrent_allocation(tmp_path):
     seed_req.cached_len = len(ids)
     with cm.lazy_free_region():
         cm.cache_req(seed_req, finished=False)
+    cm.flush_host_puts()  # async write-through: apply the queued put before evicting
     cm.unlock(seed_req.cache_handle)
     evicted = cm.prefix_cache.evict_full(len(ids))
     cm._free_swa(evicted.swa_indices)
@@ -416,6 +418,7 @@ def test_restore_skipped_when_prefill_tail_would_not_fit(tmp_path):
     seed_req.cached_len = len(ids)
     with cm.lazy_free_region():
         cm.cache_req(seed_req, finished=False)
+    cm.flush_host_puts()  # async write-through: apply the queued put before evicting
     cm.unlock(seed_req.cache_handle)
     evicted = cm.prefix_cache.evict_full(len(ids))
     cm._free_swa(evicted.swa_indices)
@@ -577,6 +580,7 @@ def test_admission_gate_failure_skips_unlock_on_plain_match(tmp_path):
     seed_req.cached_len = len(ids)
     with cm.lazy_free_region():
         cm.cache_req(seed_req, finished=False)
+    cm.flush_host_puts()  # async write-through: apply the queued put before evicting
     cm.unlock(seed_req.cache_handle)
     evicted = cm.prefix_cache.evict_full(len(ids))
     cm._free_swa(evicted.swa_indices)
@@ -596,3 +600,130 @@ def test_admission_gate_failure_skips_unlock_on_plain_match(tmp_path):
     assert adder.try_add_one(pending) is None
     assert adder.last_fail == "kv_pages"
     assert cm.prefix_cache.full_protected == 0
+
+
+def test_put_async_applies_and_releases(tmp_path):
+    """put_async gathers on the writer thread, stores the pages, and invokes the release
+    callback exactly once -- the contract the CacheManager's tree pin relies on."""
+    from collections import deque as _deque
+
+    pool = _pool()
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=4, disk_dir=tmp_path / "host")
+    full = torch.arange(2 * P, dtype=torch.int32)
+    pool.alloc_swa(full)
+    for layer in range(3):
+        pool.window_pool[layer][pool.translate_full_to_window(full).long()] = 1.0
+    ids = torch.arange(2 * P, dtype=torch.int32)
+
+    releases: _deque = _deque()
+    returned = tier.put_async(ids, full, release=lambda: releases.append(1))
+    assert returned == 2 * P            # every page was new
+    assert tier.pending_puts == 1       # queued, not yet applied
+    tier.wait_puts()
+    assert tier.pending_puts == 0
+    assert len(releases) == 1           # release ran exactly once, after the job
+    assert tier.stats.put_requests == 1 and tier.stats.put_pages == 2 * P // P
+
+    # A repeat put of the same prefix is a tier no-op and still releases.
+    releases.clear()
+    assert tier.put_async(ids, full, release=lambda: releases.append(1)) == 0
+    tier.wait_puts()
+    assert len(releases) == 1
+
+
+def test_put_async_drops_stale_generation(tmp_path):
+    """A queued put whose tier was cleared meanwhile must not resurrect stale pages."""
+    pool = _pool()
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=4)
+    full = torch.arange(P, dtype=torch.int32)
+    pool.alloc_swa(full)
+    ids = torch.arange(P, dtype=torch.int32)
+    # Direct writer-side entry with a generation from a future clear: dropped.
+    assert tier._put_sync(ids, full, P, generation=tier._generation + 1) == 0
+    assert tier.stats.put_requests == 0 and tier.host_pages_count == 0
+    # Current generation stores normally.
+    assert tier._put_sync(ids, full, P) == P
+    assert tier.host_pages_count == 1
+
+
+def test_cache_manager_async_put_pins_and_restores(tmp_path):
+    """The CacheManager async path: cache_req pins the committed path, the writer gathers
+    under the pin, the release queue hands the dec_lock back to the scheduler thread, and
+    the stored pages still restore after the GPU tree is evicted."""
+    from types import SimpleNamespace
+
+    from freetoken.core import Req, SamplingParams
+    from freetoken.scheduler.cache import CacheManager
+
+    pool = _pool()
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=2)
+    pt = torch.zeros(4, 4 * P, dtype=torch.int32)
+    cm = CacheManager(
+        num_pages=4, page_size=P, page_table=pt, type="swa_radix",
+        swa_pool=pool, sliding_window_size=P, host_prefix_cache=tier,
+    )
+
+    ids = list(range(1000, 1000 + 2 * P + 1))
+    pending = SimpleNamespace(input_ids=torch.tensor(ids, dtype=torch.int32), input_len=len(ids))
+    handle = cm.match_req(pending).cuda_handle
+    req = Req(
+        input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=0, cached_len=0,
+        output_len=0, uid=0, sampling_params=SamplingParams(), cache_handle=handle,
+    )
+    req.device_len = len(ids)
+    cm.lock(handle)
+    cm.allocate_paged([req])
+    req.cached_len = len(ids)
+    with cm.lazy_free_region():
+        cm.cache_req(req, finished=False)
+
+    # While the put is in flight the committed path is pinned against eviction...
+    assert tier.pending_puts == 1
+    assert cm.prefix_cache.full_protected >= 2 * P
+    # ...and once the writer finished and the request's own handle unlocked, the
+    # scheduler-thread drain leaves no protected ref behind.
+    cm.unlock(req.cache_handle)
+    cm.flush_host_puts()
+    assert tier.pending_puts == 0
+    assert len(cm._host_releases) == 0
+    assert cm.prefix_cache.full_protected == 0
+    assert tier.stats.put_pages == 2
+
+    # Evict the GPU tree, poison the pools, and restore purely from the async-stored tier.
+    evicted = cm.prefix_cache.evict_full(len(ids))
+    cm._free_swa(evicted.swa_indices)
+    cm._free(evicted.kv_indices)
+    for layer in range(3):
+        pool.window_pool[layer].fill_(float("nan"))
+    pool.cmp_pool[1].fill_(float("nan")); pool.cmp_pool[2].fill_(float("nan"))
+    pool.idx_pool[1].fill_(float("nan"))
+
+    restored = cm.match_req(pending).cuda_handle
+    assert restored.cached_len == 2 * P
+    assert tier.stats.restore_requests == 1
+    assert tier.stats.restore_failures == 0
+
+
+def test_match_prefix_full_returns_deepest_node():
+    """match_prefix_full covers the whole key path (no swa windowed truncation) and
+    node-aligns a partial match -- the boundary the async put pin relies on."""
+    from freetoken.kvcache.swa_radix_cache import SWARadixCache
+
+    tree = SWARadixCache(torch.device("cpu"), page_size=P, sliding_window_size=P)
+    ids = torch.arange(3 * P, dtype=torch.int32)
+    kv = torch.arange(3 * P, dtype=torch.int64)
+    tree.insert(ids, kv)
+
+    node, matched = tree.match_prefix_full(ids)
+    assert matched == 3 * P and not node.is_root()
+    assert node.length == 3 * P  # one insert call coalesces into a single node
+
+    # A diverging tail stops at the deepest shared page boundary.
+    other = ids.clone()
+    other[-1] += 1
+    node2, matched2 = tree.match_prefix_full(other)
+    assert matched2 == (3 * P - 1) // P * P  # page-aligned down: 2 pages
+
+    # A partial match inside a longer node splits it and stops at the query boundary.
+    node3, matched3 = tree.match_prefix_full(ids[:2 * P])
+    assert matched3 == 2 * P and node3.length == 2 * P

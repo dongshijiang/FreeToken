@@ -134,6 +134,30 @@ class SWARadixCache:
         kv = torch.cat(value[:best_value_len]) if best_value_len else self.empty
         return SWAMatch(kv, int(kv.numel()), best_node)
 
+    def match_prefix_full(self, input_ids: torch.Tensor) -> Tuple[RadixTreeNode, int]:
+        """Deepest node whose key path covers ``input_ids`` (page-aligned), ignoring the
+        swa windowed-reuse truncation of ``match_prefix``. Returns ``(node, matched_len)``.
+        Splits a partially matching node exactly like ``match_prefix`` so the boundary is
+        node-aligned, but stops there -- a deeper walk than a partial boundary is not
+        needed by the one caller (pinning a just-committed path, where the nodes were
+        created whole by the immediately preceding ``insert``)."""
+        node, total = self.root, 0
+        while total < len(input_ids):
+            child = node.children.get(self.key_fn(input_ids[total:]))
+            if child is None:
+                break
+            match_len = align_down(child.get_match_len(input_ids[total:]), self.page_size)
+            if match_len == 0:
+                break
+            if match_len < child.length:
+                child = child.split_at(match_len)
+                total += match_len
+                node = child
+                break
+            total += match_len
+            node = child
+        return node, total
+
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
                swa_evicted_seqlen: int = 0, update_kv_after_len: int = 0
                ) -> Tuple[int, torch.Tensor]:
