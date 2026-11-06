@@ -203,6 +203,12 @@ class DSV4PagedKVCache(BaseKVCachePool):
         self.full_to_window = torch.full(
             (sizes.full_token + 1,), -1, dtype=torch.int64, device=device
         )
+        # Reusable pinned staging buffers for host gathers, keyed by (shape, dtype).
+        # Pageable .cpu() copies stage through a driver bounce buffer and serialize per
+        # copy; pinned + non_blocking + one stream sync at the end lets the (few) big
+        # copies share the copy engine with the engine's own H2D traffic instead of
+        # round-tripping a host sync per tensor.
+        self._pinned_bufs: dict[tuple, torch.Tensor] = {}
 
         # The ONE slot map (table_idx, pos) -> full loc: the shared page_table, attached by the
         # engine policy. Window slots come from ``full_to_window``; cmp/idx rows are arithmetic.
@@ -667,26 +673,52 @@ class DSV4PagedKVCache(BaseKVCachePool):
 
         span = n * P
         win_span = ws_list[0] + span
+
+        def fetch(src: torch.Tensor, pending: list) -> torch.Tensor:
+            """Schedule a D2H copy of ``src`` into a pinned staging buffer (non_blocking
+            on the current stream) and return the staging tensor; the caller must call
+            ``flush()`` before READING anything it returned. CPU sources are cloned
+            directly."""
+            if not (src.is_cuda and self._device.type == "cuda"):
+                return src.detach().cpu().clone()
+            key = (tuple(src.shape), src.dtype)
+            buf = self._pinned_bufs.get(key)
+            if buf is None:
+                if len(self._pinned_bufs) > 32:
+                    self._pinned_bufs.clear()  # rare: many run lengths; drop and rebuild
+                buf = torch.empty(tuple(src.shape), dtype=src.dtype, pin_memory=True)
+                self._pinned_bufs[key] = buf
+            buf.copy_(src.detach(), non_blocking=True)
+            pending.append(buf)
+            return buf
+
+        pending: list[torch.Tensor] = []
+
+        def flush() -> None:
+            if pending:
+                torch.cuda.current_stream(self._device).synchronize()
+                pending.clear()
+
         windows: list[list[torch.Tensor]] = []
         for layer_id in range(self._n_layers):
-            big = self.window_pool[layer_id][ws_list[0]:win_span].detach().cpu().clone()
+            big = fetch(self.window_pool[layer_id][ws_list[0]:win_span], pending)
             windows.append([big[i * P:(i + 1) * P] for i in range(n)])
 
         cmp_all: dict[int, list[torch.Tensor]] = {}
         idx_all: dict[int, list[torch.Tensor]] = {}
-        ring_all: dict[int, dict[str, list[torch.Tensor]]] = {}
+        ring_all: dict[int, dict[str, list[torch.Tensor] | None]] = {}
         per_page: dict[int, int] = {}
         for layer_id, ratio in enumerate(self.compress_ratios):
             if not ratio:
                 continue
             row0 = base0 // ratio
             rows_n = (base0 + span) // ratio - row0
-            big_cmp = self.cmp_pool[layer_id][row0:row0 + rows_n].detach().cpu().clone()
+            big_cmp = fetch(self.cmp_pool[layer_id][row0:row0 + rows_n], pending)
             per_page[layer_id] = P // ratio
             cmp_all[layer_id] = [big_cmp[i * per_page[layer_id]:(i + 1) * per_page[layer_id]]
                                  for i in range(n)]
             if ratio == 4:
-                big_idx = self.idx_pool[layer_id][row0:row0 + rows_n].detach().cpu().clone()
+                big_idx = fetch(self.idx_pool[layer_id][row0:row0 + rows_n], pending)
                 idx_all[layer_id] = [big_idx[i * per_page[layer_id]:(i + 1) * per_page[layer_id]]
                                      for i in range(n)]
             ring_all[layer_id] = {}
@@ -696,26 +728,28 @@ class DSV4PagedKVCache(BaseKVCachePool):
                     ring_all[layer_id][tier] = None
                     continue
                 block_base = (ws_list[0] // P) * ring.ring_size
-                big = ring.buffer[block_base:block_base + n * ring.ring_size] \
-                    .detach().cpu().clone()
+                big = fetch(ring.buffer[block_base:block_base + n * ring.ring_size], pending)
                 ring_all[layer_id][tier] = [big[i * ring.ring_size:(i + 1) * ring.ring_size]
                                             for i in range(n)]
+        flush()
 
         pages: list[dict] = []
         for i in range(n):
-            cmp_i = {layer: chunk[i] for layer, chunk in cmp_all.items()}
-            idx_i = {layer: chunk[i] for layer, chunk in idx_all.items()}
-            rings_i = {
-                layer: ({tier: chunk[i] for tier, chunk in tiers.items() if chunk is not None}
-                        if tiers is not None else {})
-                for layer, tiers in ring_all.items()
-            }
-            # A None ring family must stay None in every page's payload.
+            # The staging buffers are reused by the next gather: each page's chunks are
+            # views into them, so clone once here (cheap host memcpy) to own the data.
+            cmp_i = {layer: chunks[i].clone() for layer, chunks in cmp_all.items()}
+            idx_i = {layer: chunks[i].clone() for layer, chunks in idx_all.items()}
+            rings_i = {}
             for layer, tiers in ring_all.items():
                 if tiers is None:
                     rings_i[layer] = None
+                    continue
+                rings_i[layer] = {
+                    tier: (chunks[i].clone() if chunks is not None else None)
+                    for tier, chunks in tiers.items()
+                }
             pages.append({
-                "window": [windows[layer_id][i] for layer_id in range(self._n_layers)],
+                "window": [windows[layer_id][i].clone() for layer_id in range(self._n_layers)],
                 "cmp": cmp_i, "idx": idx_i, "rings": rings_i,
             })
         return pages

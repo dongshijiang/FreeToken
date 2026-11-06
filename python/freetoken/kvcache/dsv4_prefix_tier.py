@@ -16,6 +16,7 @@ import struct
 import dataclasses
 import threading
 import time
+from collections import deque
 from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -130,6 +131,9 @@ class DSV4PrefixTier:
         # scheduler when the put is enqueued) -- not by riding the engine stream, which
         # serialized the gather behind the whole engine queue and inflated TTFT.
         self._gather_stream: torch.cuda.Stream | None = None
+        # Recent put timing breakdown (queue/event/lock/gather/insert), for diagnosing
+        # write-through overhead; bounded ring, read from stats_snapshot.
+        self._put_breakdown: deque = deque(maxlen=512)
         self._load_persisted_index()
 
     @property
@@ -183,7 +187,22 @@ class DSV4PrefixTier:
             "pending_puts": self._pending_puts,
             "capacity_pages": self.capacity_pages,
             "disk_capacity_pages": self.disk_capacity_pages,
+            **self._put_breakdown_stats(),
         }
+
+    def _put_breakdown_stats(self) -> dict:
+        """Mean of each put stage over the recent ring (queue/event/lock/gather/insert)."""
+        rows = list(self._put_breakdown)
+        if not rows:
+            return {}
+        out: dict = {"put_samples": len(rows)}
+        for key in ("queue_ms", "event_ms", "lock_ms", "gather_ms", "insert_ms", "total_ms"):
+            vals = [r[key] for r in rows if key in r]
+            if vals:
+                out[f"put_{key}_mean"] = round(sum(vals) / len(vals), 1)
+        out["put_pages_mean"] = round(
+            sum(r["pages"] for r in rows) / len(rows), 1)
+        return out
 
     def _record_latency(self, name: str, started: float) -> None:
         if name not in self._latency_samples:
@@ -331,13 +350,29 @@ class DSV4PrefixTier:
 
     @_timed("put")
     def put(self, token_ids: torch.Tensor, full_locs: torch.Tensor) -> int:
-        """Synchronous write-through (the put_async backpressure fallback)."""
+        """Synchronous write-through (the put_async backpressure fallback): enqueue on
+        the single-writer queue and block until it has been applied. Routing through the
+        writer (instead of running inline) keeps _put_sync single-threaded, which the
+        lock-free gather phase relies on."""
         ids = self._cpu(token_ids)
         aligned = align_down(len(ids), self.page_size)
         if aligned == 0:
             return 0
         locs = full_locs.detach().to("cpu", dtype=torch.int64).contiguous()
-        return self._put_sync(ids, locs, aligned)
+        with self._lock:
+            if self._closed:
+                return 0
+            generation = self._generation
+            self._pending_puts += 1
+        try:
+            fut = self._put_pool.submit(
+                self._put_job, ids[:aligned].clone(), locs, generation, None, None,
+            )
+        except RuntimeError:
+            with self._lock:
+                self._pending_puts -= 1
+            return 0  # pool already shut down
+        return fut.result()
 
     def put_async(self, token_ids: torch.Tensor, full_locs: torch.Tensor,
                   release: Callable[[], None] | None = None,
@@ -393,6 +428,9 @@ class DSV4PrefixTier:
     def _put_job(self, ids: torch.Tensor, full_locs: torch.Tensor,
                  generation: int, release: Callable[[], None] | None,
                  ready: "torch.cuda.Event | None" = None) -> None:
+        t_enqueue = time.perf_counter()
+        t_event_ms = 0.0
+        result = 0
         try:
             started = time.perf_counter()
             try:
@@ -401,14 +439,24 @@ class DSV4PrefixTier:
                 if ready is not None:
                     # Wait only for the commit writes the event covers, then gather on
                     # our own stream: the engine queue keeps running in parallel.
+                    t0 = time.perf_counter()
                     ready.synchronize()
+                    t_event_ms = (time.perf_counter() - t0) * 1e3
                 if self._gather_stream is not None:
                     with torch.cuda.stream(self._gather_stream):
-                        self._put_sync(ids, full_locs, len(ids), generation)
+                        result = self._put_sync(ids, full_locs, len(ids), generation)
                 else:
-                    self._put_sync(ids, full_locs, len(ids), generation)
+                    result = self._put_sync(ids, full_locs, len(ids), generation)
             finally:
                 self._record_latency("put", started)
+                stages = getattr(self, "_last_put_stages", {})
+                self._put_breakdown.append({
+                    "queue_ms": round((started - t_enqueue) * 1e3, 1),
+                    "event_ms": round(t_event_ms, 1),
+                    **stages,
+                    "total_ms": round((time.perf_counter() - started) * 1e3, 1),
+                    "pages": len(full_locs) // self.page_size,
+                })
         except Exception as exc:
             logger.warning("DSV4 HiCache async put failed: %r", exc)
         finally:
@@ -419,65 +467,76 @@ class DSV4PrefixTier:
                     release()
                 except Exception as exc:
                     logger.warning("DSV4 HiCache put release failed: %r", exc)
+        return result
 
     def _put_sync(self, ids: torch.Tensor, full_locs: torch.Tensor, aligned: int,
                   generation: int | None = None) -> int:
         if len(full_locs) < aligned:
             raise ValueError("DSV4 prefix tier put got fewer full locs than token ids")
-        if generation is not None:
-            with self._lock:
-                if generation != self._generation:
-                    return 0  # the tier was cleared while this job waited; drop it
-        self.stats.put_requests += 1
+        t0 = time.perf_counter()
+        # Phase 1 (tier lock): match the index and snapshot the work. Only the single
+        # writer thread runs _put_sync, so the match result stays valid across phases.
         with self._lock:
-            match = self.index.match_prefix(ids[:aligned])
-            handle = match.cuda_handle
+            if generation is not None and generation != self._generation:
+                return 0  # the tier was cleared while this job waited; drop it
+            t_lock_ms = (time.perf_counter() - t0) * 1e3
+            handle = self.index.match_prefix(ids[:aligned]).cuda_handle
             matched = int(handle.cached_len)
             self.index.lock_handle(handle)
-            try:
-                new_page_ids: list[int] = []
-                matched_rows = (
-                    handle.get_matched_indices().clone()
-                    if matched else torch.empty(0, dtype=torch.int64)
-                )
-                parent_page_id = (
-                    int(matched_rows[-1].item()) // self.page_size if matched else None
-                )
-                page_starts = [
-                    start for start in range(matched, aligned, self.page_size)
-                    if min(start + self.page_size, aligned) - start == self.page_size
+        self.stats.put_requests += 1
+        try:
+            matched_rows = (
+                handle.get_matched_indices().clone()
+                if matched else torch.empty(0, dtype=torch.int64)
+            )
+            parent_page_id = (
+                int(matched_rows[-1].item()) // self.page_size if matched else None
+            )
+            page_starts = [
+                start for start in range(matched, aligned, self.page_size)
+                if min(start + self.page_size, aligned) - start == self.page_size
+            ]
+            # Phase 2 (NO tier lock): the D2H gather. The caller's radix pin keeps the
+            # source GPU slots un-evicted for the whole put, so the lock is not needed
+            # here -- holding it during the copies serialized every scheduler-thread
+            # put_async behind ~1s of DMA and blew up high-concurrency TTFT.
+            t_gather0 = time.perf_counter()
+            payloads: list[dict] = []
+            run0 = 0
+            while run0 < len(page_starts):
+                base = int(full_locs[page_starts[run0]])
+                run1 = run0 + 1
+                while (
+                    run1 < len(page_starts)
+                    and int(full_locs[page_starts[run1]])
+                    == base + (run1 - run0) * self.page_size
+                ):
+                    run1 += 1
+                run_locs = full_locs[
+                    page_starts[run0]:page_starts[run1 - 1] + self.page_size
                 ]
-                # Gather whole contiguous runs in one shot (a freshly committed suffix
-                # is one sequential full-slot run): ~2*n_layers+2 GPU ops per run
-                # instead of ~15 per page.
-                payloads: list[dict] = []
-                run0 = 0
-                while run0 < len(page_starts):
-                    base = int(full_locs[page_starts[run0]])
-                    run1 = run0 + 1
-                    while (
-                        run1 < len(page_starts)
-                        and int(full_locs[page_starts[run1]])
-                        == base + (run1 - run0) * self.page_size
-                    ):
-                        run1 += 1
-                    run_locs = full_locs[
-                        page_starts[run0]:page_starts[run1 - 1] + self.page_size
-                    ]
-                    try:
-                        payloads.extend(self.pool.gather_prefix_pages(run_locs))
-                    except AssertionError:
-                        seg = run_locs.tolist()
-                        seg_base = seg[0]
-                        bad = [i for i, v in enumerate(seg) if v != seg_base + i]
-                        logger.error(
-                            "DSV4 HiCache put non-contiguous run pages [%d,%d) "
-                            "matched=%d: base=%d first16=%s first_bad_off=%s",
-                            page_starts[run0], page_starts[run1 - 1] + self.page_size,
-                            matched, seg_base, seg[:16], bad[:4],
-                        )
-                        raise
-                    run0 = run1
+                try:
+                    payloads.extend(self.pool.gather_prefix_pages(run_locs))
+                except AssertionError:
+                    seg = run_locs.tolist()
+                    seg_base = seg[0]
+                    bad = [i for i, v in enumerate(seg) if v != seg_base + i]
+                    logger.error(
+                        "DSV4 HiCache put non-contiguous run pages [%d,%d) "
+                        "matched=%d: base=%d first16=%s first_bad_off=%s",
+                        page_starts[run0], page_starts[run1 - 1] + self.page_size,
+                        matched, seg_base, seg[:16], bad[:4],
+                    )
+                    raise
+                run0 = run1
+            t_gather_ms = (time.perf_counter() - t_gather0) * 1e3
+            # Phase 3 (tier lock): host bookkeeping + index insert. Prefetch workers
+            # also insert into the index, so the mutation stays under the lock.
+            with self._lock:
+                if generation is not None and generation != self._generation:
+                    return 0  # cleared while gathering; drop the gathered pages
+                t_ins0 = time.perf_counter()
+                new_page_ids: list[int] = []
                 for start, payload in zip(page_starts, payloads):
                     end = start + self.page_size
                     payload["token_ids"] = ids[start:end].clone()
@@ -501,9 +560,21 @@ class DSV4PrefixTier:
                 result = self.index.insert_prefix(
                     ids[:aligned], torch.cat((matched_rows, new_rows))[:aligned]
                 )
-                return int(result.handle.cached_len)
-            finally:
-                self.index.lock_handle(handle, unlock=True)
+            t_insert_ms = (time.perf_counter() - t_ins0) * 1e3
+            self._last_put_stages = {
+                "lock_ms": round(t_lock_ms, 1),
+                "gather_ms": round(t_gather_ms, 1),
+                "insert_ms": round(t_insert_ms, 1),
+            }
+            logger.info(
+                "DSV4 HiCache put: pages=%d lock=%.0fms gather=%.0fms "
+                "insert=%.0fms total=%.0fms",
+                len(page_starts), t_lock_ms, t_gather_ms, t_insert_ms,
+                (time.perf_counter() - t0) * 1e3,
+            )
+            return int(result.handle.cached_len)
+        finally:
+            self.index.lock_handle(handle, unlock=True)
 
     @_timed("get")
     def get(self, token_ids: torch.Tensor, full_locs: torch.Tensor) -> int:
