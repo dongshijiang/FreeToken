@@ -125,10 +125,11 @@ class DSV4PrefixTier:
         self._prefetch_writes: dict[int, Future] = {}
         self._closed = False
         self._lock = threading.RLock()
-        # The engine drives the scheduler on a dedicated CUDA stream; the put writer
-        # thread's GPU reads must ride the SAME stream (wired by the scheduler), else
-        # they race the engine's in-flight pool writes on the default stream.
-        self.engine_stream: torch.cuda.Stream | None = None
+        # The put writer thread gathers pool reads on its OWN CUDA stream, ordered
+        # against the engine's commit writes by a per-put ready event (recorded by the
+        # scheduler when the put is enqueued) -- not by riding the engine stream, which
+        # serialized the gather behind the whole engine queue and inflated TTFT.
+        self._gather_stream: torch.cuda.Stream | None = None
         self._load_persisted_index()
 
     @property
@@ -339,14 +340,17 @@ class DSV4PrefixTier:
         return self._put_sync(ids, locs, aligned)
 
     def put_async(self, token_ids: torch.Tensor, full_locs: torch.Tensor,
-                  release: Callable[[], None] | None = None) -> int:
+                  release: Callable[[], None] | None = None,
+                  ready: "torch.cuda.Event | None" = None) -> int:
         """Asynchronous write-through: enqueue the gather+store and return immediately.
 
         The CALLER guarantees the source GPU slots stay un-evicted until the writer
         gathers them (the CacheManager pins the committed tree path and drops the pin
         via ``release``, which this tier invokes on the writer thread once the job has
         run -- success or failure). Single-writer FIFO keeps overlapping puts consistent:
-        a later job's tier match always sees earlier jobs' inserts.
+        a later job's tier match always sees earlier jobs' inserts. ``ready`` is a CUDA
+        event recorded on the engine stream AFTER the commit writes it covers; the
+        writer waits on it instead of the whole engine queue.
         """
         ids = self._cpu(token_ids)
         aligned = align_down(len(ids), self.page_size)
@@ -372,7 +376,7 @@ class DSV4PrefixTier:
         with self._lock:
             self._pending_puts += 1
         self._put_pool.submit(
-            self._put_job, ids[:aligned].clone(), locs, generation, release,
+            self._put_job, ids[:aligned].clone(), locs, generation, release, ready,
         )
         return aligned - matched
 
@@ -387,14 +391,19 @@ class DSV4PrefixTier:
             pass  # pool already shut down; close() drained it
 
     def _put_job(self, ids: torch.Tensor, full_locs: torch.Tensor,
-                 generation: int, release: Callable[[], None] | None) -> None:
+                 generation: int, release: Callable[[], None] | None,
+                 ready: "torch.cuda.Event | None" = None) -> None:
         try:
             started = time.perf_counter()
             try:
-                if self.engine_stream is not None:
-                    # Gather on the engine's stream: orders these reads after every pool
-                    # write the scheduler had issued when the put was enqueued.
-                    with torch.cuda.stream(self.engine_stream):
+                if self._gather_stream is None and torch.cuda.is_available():
+                    self._gather_stream = torch.cuda.Stream()
+                if ready is not None:
+                    # Wait only for the commit writes the event covers, then gather on
+                    # our own stream: the engine queue keeps running in parallel.
+                    ready.synchronize()
+                if self._gather_stream is not None:
+                    with torch.cuda.stream(self._gather_stream):
                         self._put_sync(ids, full_locs, len(ids), generation)
                 else:
                     self._put_sync(ids, full_locs, len(ids), generation)
@@ -434,22 +443,43 @@ class DSV4PrefixTier:
                 parent_page_id = (
                     int(matched_rows[-1].item()) // self.page_size if matched else None
                 )
-                for start in range(matched, aligned, self.page_size):
-                    end = min(start + self.page_size, aligned)
-                    if end - start != self.page_size:
-                        break  # put is always page-aligned; ignore a malformed tail
+                page_starts = [
+                    start for start in range(matched, aligned, self.page_size)
+                    if min(start + self.page_size, aligned) - start == self.page_size
+                ]
+                # Gather whole contiguous runs in one shot (a freshly committed suffix
+                # is one sequential full-slot run): ~2*n_layers+2 GPU ops per run
+                # instead of ~15 per page.
+                payloads: list[dict] = []
+                run0 = 0
+                while run0 < len(page_starts):
+                    base = int(full_locs[page_starts[run0]])
+                    run1 = run0 + 1
+                    while (
+                        run1 < len(page_starts)
+                        and int(full_locs[page_starts[run1]])
+                        == base + (run1 - run0) * self.page_size
+                    ):
+                        run1 += 1
+                    run_locs = full_locs[
+                        page_starts[run0]:page_starts[run1 - 1] + self.page_size
+                    ]
                     try:
-                        payload = self.pool.gather_prefix_page(full_locs[start:end])
+                        payloads.extend(self.pool.gather_prefix_pages(run_locs))
                     except AssertionError:
-                        seg = full_locs[start:end].tolist()
-                        base = seg[0]
-                        bad = [i for i, v in enumerate(seg) if v != base + i]
+                        seg = run_locs.tolist()
+                        seg_base = seg[0]
+                        bad = [i for i, v in enumerate(seg) if v != seg_base + i]
                         logger.error(
-                            "DSV4 HiCache put non-contiguous page [%d,%d) matched=%d: "
-                            "base=%d first16=%s first_bad_off=%s",
-                            start, end, matched, base, seg[:16], bad[:4],
+                            "DSV4 HiCache put non-contiguous run pages [%d,%d) "
+                            "matched=%d: base=%d first16=%s first_bad_off=%s",
+                            page_starts[run0], page_starts[run1 - 1] + self.page_size,
+                            matched, seg_base, seg[:16], bad[:4],
                         )
                         raise
+                    run0 = run1
+                for start, payload in zip(page_starts, payloads):
+                    end = start + self.page_size
                     payload["token_ids"] = ids[start:end].clone()
                     self._ensure_host_capacity(1)
                     page_id = self._allocate_page_ids(1)[0]

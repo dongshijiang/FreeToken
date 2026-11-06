@@ -824,10 +824,17 @@ class CacheManager:
             self._host_releases.append((tree, node, swa_uuid))
 
         try:
+            # Record the commit boundary on the engine stream: the tier's writer waits
+            # on this event (not the whole engine queue) before gathering the pools.
+            ready = None
+            if torch.cuda.is_available() and self.page_table.is_cuda:
+                ready = torch.cuda.Event()
+                ready.record()
             host.put_async(
                 req.input_ids[:insert_len],
                 self.page_table[req.table_idx, :insert_len].clone(),
                 release=release,
+                ready=ready,
             )
         except Exception:
             release()  # never leak the pin, even when the enqueue itself fails

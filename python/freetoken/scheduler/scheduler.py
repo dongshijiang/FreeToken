@@ -105,10 +105,6 @@ class Scheduler(SchedulerIOMixin):
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
             host_prefix_cache=self._create_host_prefix_cache(config),
         )
-        # Async host puts gather GPU pages on the tier's writer thread; point it at the
-        # engine's stream so those reads order after the scheduler's own pool writes.
-        if self.cache_manager.host_prefix_cache is not None:
-            self.cache_manager.host_prefix_cache.engine_stream = self.engine.stream
         self.decode_manager = DecodeManager(config.page_size)
         self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
         self.prefill_manager = PrefillManager(

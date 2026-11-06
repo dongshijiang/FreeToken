@@ -85,6 +85,56 @@ def test_dsv4_prefix_page_roundtrip():
     )
 
 
+def test_dsv4_prefix_batched_gather_matches_per_page():
+    pool = _pool()
+    full = torch.arange(2 * P, dtype=torch.int32)
+    pool.alloc_swa(full)
+    window_slots = pool.translate_full_to_window(full)
+    for layer in range(3):
+        pool.window_pool[layer][window_slots.long()] = torch.arange(
+            2 * P, dtype=torch.bfloat16).unsqueeze(1) + 100 * layer
+    pool.cmp_pool[1][torch.arange(32)] = torch.arange(32, dtype=torch.bfloat16).unsqueeze(1) + 7
+    pool.cmp_pool[2][torch.arange(2)] = torch.tensor([[31] * 8, [63] * 8], dtype=torch.bfloat16)
+    pool.idx_pool[1][torch.arange(32)] = torch.arange(32, dtype=torch.bfloat16).unsqueeze(1) + 9
+    pool.state_ring[2].buffer[:128] = torch.arange(
+        128 * pool.state_ring[2].buffer.shape[-1], dtype=torch.float32
+    ).view(128, -1)
+
+    batched = pool.gather_prefix_pages(full)
+    assert len(batched) == 2
+    per_page = [pool.gather_prefix_page(full[i * P:(i + 1) * P]) for i in range(2)]
+    for b, s in zip(batched, per_page):
+        assert (b["window"] is None) == (s["window"] is None)
+        if s["window"] is not None:
+            for layer in range(3):
+                assert torch.equal(b["window"][layer], s["window"][layer])
+        for layer_id, ratio in enumerate(pool.compress_ratios):
+            if not ratio:
+                continue
+            assert torch.equal(b["cmp"][layer_id], s["cmp"][layer_id])
+            if ratio == 4:
+                assert torch.equal(b["idx"][layer_id], s["idx"][layer_id])
+            for tier in ("attn", "idx"):
+                got = b["rings"].get(layer_id, {}).get(tier)
+                want = s["rings"].get(layer_id, {}).get(tier)
+                if want is None:
+                    assert got is None
+                else:
+                    assert torch.equal(got, want)
+
+    # Scatter the window slots so the run is no longer one contiguous bound range:
+    # the batched gather must fall back to the per-page path and stay correct.
+    pool.full_to_window[full.long()] = -1
+    pool.full_to_window[full[P:].long()] = torch.arange(2 * P, 3 * P, dtype=torch.int64)
+    scattered = pool.gather_prefix_pages(full)
+    assert scattered[0]["window"] is None
+    for layer in range(3):
+        assert torch.equal(
+            scattered[1]["window"][layer],
+            pool.gather_prefix_page(full[P:])["window"][layer],
+        )
+
+
 def test_dsv4_prefix_tier_spills_and_restores(tmp_path):
     pool = _pool()
     full = torch.arange(2 * P, dtype=torch.int32)

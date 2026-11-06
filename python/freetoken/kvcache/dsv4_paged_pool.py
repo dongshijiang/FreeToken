@@ -641,6 +641,85 @@ class DSV4PagedKVCache(BaseKVCachePool):
                     )
         return {"window": window, "cmp": cmp, "idx": idx, "rings": rings}
 
+    def gather_prefix_pages(self, full_locs: torch.Tensor) -> list[dict]:
+        """Batched gather of n whole pages: one contiguity check on CPU (zero GPU
+        syncs), one indexed read of ``full_to_window``, then per-layer slices over the
+        whole run -- ~2*n_layers+2 GPU ops instead of ~15 per page. The caller passes
+        CPU int64 locs (frozen at enqueue). Falls back to the per-page gather when the
+        run's window slots are not one contiguous bound range (rare: freshly committed
+        suffixes allocate full+window pages as one sequential run)."""
+        P = self.P
+        locs = full_locs.detach().to("cpu", dtype=torch.int64).contiguous()
+        n = locs.numel() // P
+        assert n >= 1 and locs.numel() % P == 0
+        base0 = int(locs[0])
+        if any(int(v) != base0 + i for i, v in enumerate(locs.tolist())):
+            raise AssertionError("DSV4 HiCache pages must be contiguous full-token pages")
+        bases = torch.arange(base0, base0 + n * P, P, device=self._device)
+        ws_list = self.full_to_window[bases].cpu().tolist()
+        if any(w % P for w in ws_list if w >= 0):
+            raise AssertionError("DSV4 HiCache window slot is not page-aligned")
+        if not all(0 <= ws_list[i] == ws_list[0] + i * P for i in range(n)) or any(
+            ratio and (P % ratio or base0 % ratio) for ratio in self.compress_ratios
+        ):
+            # Scattered/unbound window pages or unaligned compressed rows: slow path.
+            return [self.gather_prefix_page(locs[i * P:(i + 1) * P]) for i in range(n)]
+
+        span = n * P
+        win_span = ws_list[0] + span
+        windows: list[list[torch.Tensor]] = []
+        for layer_id in range(self._n_layers):
+            big = self.window_pool[layer_id][ws_list[0]:win_span].detach().cpu().clone()
+            windows.append([big[i * P:(i + 1) * P] for i in range(n)])
+
+        cmp_all: dict[int, list[torch.Tensor]] = {}
+        idx_all: dict[int, list[torch.Tensor]] = {}
+        ring_all: dict[int, dict[str, list[torch.Tensor]]] = {}
+        per_page: dict[int, int] = {}
+        for layer_id, ratio in enumerate(self.compress_ratios):
+            if not ratio:
+                continue
+            row0 = base0 // ratio
+            rows_n = (base0 + span) // ratio - row0
+            big_cmp = self.cmp_pool[layer_id][row0:row0 + rows_n].detach().cpu().clone()
+            per_page[layer_id] = P // ratio
+            cmp_all[layer_id] = [big_cmp[i * per_page[layer_id]:(i + 1) * per_page[layer_id]]
+                                 for i in range(n)]
+            if ratio == 4:
+                big_idx = self.idx_pool[layer_id][row0:row0 + rows_n].detach().cpu().clone()
+                idx_all[layer_id] = [big_idx[i * per_page[layer_id]:(i + 1) * per_page[layer_id]]
+                                     for i in range(n)]
+            ring_all[layer_id] = {}
+            for tier, attr in (("attn", "state_ring"), ("idx", "indexer_state_ring")):
+                ring = getattr(self, attr)[layer_id]
+                if ring is None:
+                    ring_all[layer_id][tier] = None
+                    continue
+                block_base = (ws_list[0] // P) * ring.ring_size
+                big = ring.buffer[block_base:block_base + n * ring.ring_size] \
+                    .detach().cpu().clone()
+                ring_all[layer_id][tier] = [big[i * ring.ring_size:(i + 1) * ring.ring_size]
+                                            for i in range(n)]
+
+        pages: list[dict] = []
+        for i in range(n):
+            cmp_i = {layer: chunk[i] for layer, chunk in cmp_all.items()}
+            idx_i = {layer: chunk[i] for layer, chunk in idx_all.items()}
+            rings_i = {
+                layer: ({tier: chunk[i] for tier, chunk in tiers.items() if chunk is not None}
+                        if tiers is not None else {})
+                for layer, tiers in ring_all.items()
+            }
+            # A None ring family must stay None in every page's payload.
+            for layer, tiers in ring_all.items():
+                if tiers is None:
+                    rings_i[layer] = None
+            pages.append({
+                "window": [windows[layer_id][i] for layer_id in range(self._n_layers)],
+                "cmp": cmp_i, "idx": idx_i, "rings": rings_i,
+            })
+        return pages
+
     def scatter_prefix_page(self, full_locs: torch.Tensor, payload: dict) -> None:
         P = self.P
         fi = full_locs.detach().to(device=self._device, dtype=torch.int64)
