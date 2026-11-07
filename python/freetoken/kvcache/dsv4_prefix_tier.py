@@ -309,8 +309,7 @@ class DSV4PrefixTier:
         try:
             rows = handle.get_matched_indices()
             last_good = -1
-            for page_idx, lo in enumerate(range(0, matched, self.page_size)):
-                page_id = int(rows[lo].item()) // self.page_size
+            for page_idx, page_id in enumerate(self._page_ids(rows, matched, self.page_size)):
                 if self._page_has_window(page_id):
                     last_good = page_idx
             return (last_good + 1) * self.page_size if last_good >= 0 else 0
@@ -336,8 +335,7 @@ class DSV4PrefixTier:
         try:
             rows = handle.get_matched_indices()
             out = []
-            for page_idx, lo in enumerate(range(0, matched, self.page_size)):
-                page_id = int(rows[lo].item()) // self.page_size
+            for page_idx, page_id in enumerate(self._page_ids(rows, matched, self.page_size)):
                 if self._page_has_window(page_id):
                     out.append(page_idx)
             return out
@@ -665,16 +663,24 @@ class DSV4PrefixTier:
             self.index.lock_handle(handle)
             try:
                 rows = handle.get_matched_indices()
-                for page_idx in range(pages):
+                for page_idx, page_id in enumerate(
+                        self._page_ids(rows, pages * self.page_size, self.page_size)):
                     lo = page_idx * self.page_size
-                    hi = lo + self.page_size
-                    page_id = int(rows[lo].item()) // self.page_size
                     payload = self._restore_page(page_id)
-                    self.pool.scatter_prefix_page(full_locs[lo:hi], payload)
+                    self.pool.scatter_prefix_page(full_locs[lo:lo + self.page_size], payload)
                     self.stats.restore_pages += 1
                 return target
             finally:
                 self.index.lock_handle(handle, unlock=True)
+
+    @staticmethod
+    def _page_ids(rows: torch.Tensor, ntokens: int, page_size: int) -> list[int]:
+        """Page id per page-start row, gathered with a single device sync.
+
+        Calling ``rows[lo].item()`` per page costs a CPU-GPU round trip each
+        iteration; one strided slice + tolist syncs once for the whole span.
+        """
+        return (rows[:ntokens:page_size] // page_size).tolist()
 
     def _restore_page(self, page_id: int) -> dict:
         """A restore-segment payload, preferring the GPUDirect read when possible.

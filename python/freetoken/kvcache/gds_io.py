@@ -335,7 +335,9 @@ class GdsPageReader:
     torch's ``load_storage`` reads ``storage.nbytes`` bytes from a file offset,
     so each distinct block size gets its own exactly-sized staging tensor,
     registered once. Restore pages come in a handful of distinct sizes (window
-    bound or not), which keeps the registrations bounded.
+    bound or not), which keeps the registrations bounded. The returned tensors
+    alias the reused staging buffer: they are valid until the next ``read_page``
+    of the same block size overwrites it, so consume them before reading again.
     """
 
     def __init__(self, device: torch.device, max_staged: int = 8,
@@ -351,6 +353,38 @@ class GdsPageReader:
         # triple invalidates an entry when a page file is rewritten or replaced.
         self._handles: OrderedDict[tuple, object] = OrderedDict()
         self._max_handles = max_handles
+        # Restoring a page re-parses a ~64KB header JSON and rebuilds ~170
+        # tensor views, together ~0.8ms of pure CPU per page (measured) - over
+        # a third of the per-page restore cost at 17MB pages. Headers are
+        # cached per file identity (same key as handles, so a rewritten page
+        # re-parses); views are cached per tensor layout because staging is
+        # reused per block size, so the view objects are identical for every
+        # page of the same layout and pick up the new bytes after each DMA.
+        self._headers: OrderedDict[tuple, dict] = OrderedDict()
+        self._views: OrderedDict[tuple, dict[str, torch.Tensor]] = OrderedDict()
+        self._max_cached = max(max_handles, 2 * max_staged)
+
+    def _header_for(self, path: Path) -> dict:
+        st = os.stat(path)
+        key = (str(path), st.st_ino, st.st_mtime_ns, st.st_size)
+        header = self._headers.get(key)
+        if header is None:
+            for stale in [k for k in self._headers if k[0] == key[0]]:
+                self._headers.pop(stale)
+            header = read_header(path)
+            self._headers[key] = header
+            while len(self._headers) > self._max_cached:
+                self._headers.popitem(last=False)
+        else:
+            self._headers.move_to_end(key)
+        return header
+
+    @staticmethod
+    def _layout_key(header: dict) -> tuple:
+        return tuple(
+            (name, spec["offset"], spec["nbytes"], spec["dtype"], tuple(spec["shape"]))
+            for name, spec in header["tensors"].items()
+        )
 
     def _handle_for(self, path: Path):
         st = os.stat(path)
@@ -377,7 +411,7 @@ class GdsPageReader:
             pass
 
     def read_page(self, path: Path) -> dict[str, torch.Tensor]:
-        header = read_header(path)
+        header = self._header_for(path)
         block_nbytes = header["block_nbytes"]
         if block_nbytes == 0:
             return {}
@@ -385,7 +419,16 @@ class GdsPageReader:
         handle = self._handle_for(path)
         handle.load_storage(staging.untyped_storage(), offset=header["block_offset"])
         _verify_block(header, staging, path)
-        return _slice_views(staging, header)
+        key = self._layout_key(header)
+        flat = self._views.get(key)
+        if flat is None:
+            flat = _slice_views(staging, header)
+            self._views[key] = flat
+            while len(self._views) > self._max_cached:
+                self._views.popitem(last=False)
+        else:
+            self._views.move_to_end(key)
+        return flat
 
     def _staging_for(self, nbytes: int) -> torch.Tensor:
         buf = self._staging.get(nbytes)
@@ -414,6 +457,8 @@ class GdsPageReader:
             except Exception:
                 pass
         self._staging.clear()
+        self._headers.clear()
+        self._views.clear()
 
 
 __all__ = [
