@@ -424,8 +424,12 @@ class CacheManager:
         if host is None or not getattr(host, "supports_dsv4", False) or len(token_ids) < 2:
             return
         try:
+            # Warm only what the GPU radix cannot already serve. Warming a
+            # resident prefix would burn disk reads for nothing and, on a full
+            # host tier, re-spill pages that are already on disk.
+            gpu_matched = int(self.prefix_cache.match_prefix(token_ids).cached_len)
             # match_req excludes the final prompt token; prefetch exactly that range.
-            host.prefetch(token_ids[: len(token_ids) - 1])
+            host.prefetch(token_ids[: len(token_ids) - 1], start=gpu_matched)
         except Exception as exc:
             logger.warning("DSV4 host prefix prefetch failed: %r", exc)
 
