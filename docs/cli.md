@@ -93,6 +93,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--host-prefix-cache-gib` | 16 | Host RAM budget for the prefix tier |
 | `--host-prefix-cache-dir` | none | Directory for host-tier spill pages; required when the tier exceeds the RAM budget. TP ranks use `tp-<rank>` subdirectories. Admission prefetches disk-resident DSV4 pages, orderly shutdown persists resident pages, and restart rebuilds the index from sidecars |
 | `--host-prefix-cache-disk-gib` | unlimited | SSD budget for the DSV4 prefix tier; when full, the lowest-value complete prefix is evicted |
+| `--host-prefix-cache-gds` | off | Restore SSD-resident pages straight into GPU memory with GPUDirect Storage (cuFile), skipping host RAM and CPU deserialization. Pages are written in a raw GDS-readable format; falls back to the host path when the nvidia_fs kernel module is missing |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
 ### API behaviour

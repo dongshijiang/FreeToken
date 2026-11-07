@@ -94,6 +94,9 @@ class EngineConfig:
     host_prefix_cache_gib: float = 16.0
     host_prefix_cache_dir: str | None = None
     host_prefix_cache_disk_gib: float = 0.0
+    # Restore SSD-resident prefix pages straight into GPU memory via GPUDirect
+    # Storage; falls back to the host path when nvidia_fs is unavailable.
+    host_prefix_cache_gds: bool = False
     # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 

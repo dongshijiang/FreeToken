@@ -777,3 +777,208 @@ def test_match_prefix_full_returns_deepest_node():
     # A partial match inside a longer node splits it and stops at the query boundary.
     node3, matched3 = tree.match_prefix_full(ids[:2 * P])
     assert matched3 == 2 * P and node3.length == 2 * P
+
+
+def _fill_pool_for_prefix(pool, full, ids_len):
+    window_slots = pool.translate_full_to_window(full)
+    for layer in range(3):
+        pool.window_pool[layer][window_slots.long()] = torch.arange(
+            len(full), dtype=torch.bfloat16).unsqueeze(1) + 100 * layer
+    pool.cmp_pool[1][torch.arange(32)] = torch.arange(32, dtype=torch.bfloat16).unsqueeze(1) + 7
+    pool.cmp_pool[2][torch.arange(2)] = torch.tensor([[31] * 8, [63] * 8], dtype=torch.bfloat16)
+    pool.idx_pool[1][torch.arange(32)] = torch.arange(32, dtype=torch.bfloat16).unsqueeze(1) + 9
+    pool.state_ring[1].buffer[:8] = torch.arange(
+        8 * pool.state_ring[1].buffer.shape[-1], dtype=torch.float32
+    ).view(8, -1)
+    pool.state_ring[2].buffer[:128] = torch.arange(
+        128 * pool.state_ring[2].buffer.shape[-1], dtype=torch.float32
+    ).view(128, -1)
+
+
+def test_dsv4_prefix_tier_raw_page_roundtrip(tmp_path):
+    from freetoken.kvcache import gds_io
+
+    pool = _pool()
+    full = torch.arange(2 * P, dtype=torch.int32)
+    pool.alloc_swa(full)
+    ids = torch.arange(1000, 1000 + 2 * P, dtype=torch.int32)
+    _fill_pool_for_prefix(pool, full, 2 * P)
+    expected_window = pool.window_pool[0][
+        pool.translate_full_to_window(full).long()
+    ].cpu().clone()
+
+    first = DSV4PrefixTier(
+        pool, page_size=P, capacity_pages=1, disk_dir=tmp_path / "host", use_gds=True
+    )
+    assert first.put(ids, full) == 2 * P
+    first.close()
+    paths = sorted((tmp_path / "host").glob("page-*.pt"))
+    assert len(paths) == 2
+    assert all(gds_io.is_raw_page(p) for p in paths)
+
+    second = DSV4PrefixTier(
+        pool, page_size=P, capacity_pages=2, disk_dir=tmp_path / "host", use_gds=True
+    )
+    assert second.match_len(ids) == 2 * P
+
+    pool.free_swa(full)
+    for layer in range(3):
+        pool.window_pool[layer].fill_(float("nan"))
+    pool.cmp_pool[1].fill_(float("nan")); pool.cmp_pool[2].fill_(float("nan"))
+    pool.idx_pool[1].fill_(float("nan"))
+    pool.state_ring[1].buffer.fill_(float("nan")); pool.indexer_state_ring[1].buffer.fill_(float("nan"))
+    pool.state_ring[2].buffer.fill_(float("nan"))
+    pool.alloc_swa(full)
+
+    assert second.get(ids, full) == 2 * P
+    assert torch.equal(
+        pool.window_pool[0][pool.translate_full_to_window(full).long()].cpu(),
+        expected_window,
+    )
+    assert second.stats.disk_reads == 2
+    assert second.stats.gds_reads == 0  # CPU pool: the GDS reader never engages
+    second.close()
+
+
+def test_dsv4_prefix_tier_raw_rejects_corruption(tmp_path):
+    from freetoken.kvcache import gds_io
+
+    pool = _pool()
+    full = torch.arange(P, dtype=torch.int32)
+    pool.alloc_swa(full)
+    ids = torch.arange(1000, 1000 + P, dtype=torch.int32)
+    _fill_pool_for_prefix(pool, full, P)
+
+    first = DSV4PrefixTier(
+        pool, page_size=P, capacity_pages=1, disk_dir=tmp_path / "host", use_gds=True
+    )
+    assert first.put(ids, full) == P
+    first.close()
+
+    path = next((tmp_path / "host").glob("page-*.pt"))
+    header = gds_io.read_header(path)
+    raw = bytearray(path.read_bytes())
+    raw[header["block_offset"] + 3] ^= 0xFF
+    path.write_bytes(bytes(raw))
+
+    second = DSV4PrefixTier(
+        pool, page_size=P, capacity_pages=1, disk_dir=tmp_path / "host", use_gds=True
+    )
+    assert second.match_len(ids) == P
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
+        second.get(ids, full)
+
+
+def test_dsv4_prefix_tier_reads_mixed_page_formats(tmp_path):
+    from freetoken.kvcache import gds_io
+
+    pool = _pool()
+    full = torch.arange(2 * P, dtype=torch.int32)
+    pool.alloc_swa(full)
+    ids = torch.arange(1000, 1000 + 2 * P, dtype=torch.int32)
+    _fill_pool_for_prefix(pool, full, 2 * P)
+    expected_window = pool.window_pool[0][
+        pool.translate_full_to_window(full).long()
+    ].cpu().clone()
+
+    # Page 0 is written in the legacy torch.save format, page 1 in raw format.
+    legacy = DSV4PrefixTier(pool, page_size=P, capacity_pages=1, disk_dir=tmp_path / "host")
+    assert legacy.put(ids[:P], full[:P]) == P
+    legacy.close()
+    raw = DSV4PrefixTier(
+        pool, page_size=P, capacity_pages=1, disk_dir=tmp_path / "host", use_gds=True
+    )
+    assert raw.put(ids, full) == 2 * P
+    raw.close()
+    paths = sorted((tmp_path / "host").glob("page-*.pt"))
+    assert [gds_io.is_raw_page(p) for p in paths] == [False, True]
+
+    third = DSV4PrefixTier(pool, page_size=P, capacity_pages=2, disk_dir=tmp_path / "host")
+    assert third.match_len(ids) == 2 * P
+
+    pool.free_swa(full)
+    for layer in range(3):
+        pool.window_pool[layer].fill_(float("nan"))
+    pool.cmp_pool[1].fill_(float("nan")); pool.cmp_pool[2].fill_(float("nan"))
+    pool.idx_pool[1].fill_(float("nan"))
+    pool.alloc_swa(full)
+    assert third.get(ids, full) == 2 * P
+    assert torch.equal(
+        pool.window_pool[0][pool.translate_full_to_window(full).long()].cpu(),
+        expected_window,
+    )
+
+
+def test_bytes_per_page_matches_payload_size():
+    pool = _pool()
+    full = torch.arange(2 * P, dtype=torch.int32)
+    pool.alloc_swa(full)
+    for layer in range(3):
+        pool.window_pool[layer][pool.translate_full_to_window(full).long()] = 1.0
+    pool.cmp_pool[1][:32] = 1.0
+    pool.cmp_pool[2][:2] = 1.0
+    pool.idx_pool[1][:32] = 1.0
+    pool.state_ring[1].buffer[:8] = 1.0
+    pool.state_ring[2].buffer[:128] = 1.0
+
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=1)
+    payload = pool.gather_prefix_page(full[:P])
+    from freetoken.kvcache.dsv4_prefix_tier import _payload_to_tensors
+    actual = sum(t.numel() * t.element_size()
+                 for t in _payload_to_tensors(payload).values())
+    assert tier.bytes_per_page() == actual
+
+
+def test_dsv4_prefix_tier_warm_does_not_respill_disk_pages(tmp_path):
+    pool = _pool()
+    n = 3
+    full = torch.arange(n * P, dtype=torch.int32)
+    pool.alloc_swa(full)
+    ids = torch.arange(1000, 1000 + n * P, dtype=torch.int32)
+    window_slots = pool.translate_full_to_window(full)
+    for layer in range(3):
+        pool.window_pool[layer][window_slots.long()] = torch.arange(
+            n * P, dtype=torch.bfloat16).unsqueeze(1) + 100 * layer
+
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=2, disk_dir=tmp_path / "host")
+    assert tier.put(ids, full) == n * P
+    tier.flush()
+    # page 0 spilled; pages 1,2 still host-resident
+    assert tier.disk_pages_count == 1
+    writes_after_put = tier.stats.disk_writes
+
+    # Three warm passes rotate all pages through the 2-page host tier: pages 1,2
+    # spill once each (legit first-time writes), and the final pass evicts an
+    # already-spilled page from host, which must not write again.
+    for _ in range(3):
+        tier.prefetch(ids)
+        tier.wait_prefetch(ids)
+    tier.flush()
+    assert tier.stats.disk_writes == writes_after_put + 2
+
+
+def test_dsv4_prefix_tier_prefetch_skips_gpu_resident_pages(tmp_path):
+    pool = _pool()
+    full = torch.arange(2 * P, dtype=torch.int32)
+    pool.alloc_swa(full)
+    ids = torch.arange(1000, 1000 + 2 * P, dtype=torch.int32)
+
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=1, disk_dir=tmp_path / "host")
+    assert tier.put(ids, full) == 2 * P
+    tier.flush()
+
+    # A GPU radix match covering both pages must schedule no disk warming.
+    assert tier.prefetch(ids, start=2 * P) == 0
+    assert tier.stats.prefetch_scheduled == 0
+    assert tier.stats.prefetch_gpu_resident == 2
+
+    # Move page 1 to disk so the partial match below has something to warm.
+    assert tier.prefetch(ids[:P]) == 1
+    tier.wait_prefetch(ids[:P])
+    assert tier.stats.prefetch_scheduled == 1
+
+    # A partial GPU match warms only the uncovered tail page.
+    assert tier.prefetch(ids, start=P) == 1
+    tier.wait_prefetch(ids[P:])
+    assert tier.stats.prefetch_scheduled == 2
+    assert tier.stats.prefetch_gpu_resident == 3

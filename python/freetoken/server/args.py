@@ -836,6 +836,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--host-prefix-cache-gds",
+        action="store_true",
+        dest="host_prefix_cache_gds",
+        default=ServerArgs.host_prefix_cache_gds,
+        help=(
+            "Restore SSD-resident prefix pages straight into GPU memory with GPUDirect "
+            "Storage (cuFile), skipping host RAM and CPU deserialization. Falls back to "
+            "the host path when the nvidia_fs kernel module is missing."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",

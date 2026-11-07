@@ -11,6 +11,8 @@ import torch
 
 from freetoken.utils import align_down, div_ceil, init_logger
 
+from . import gds_io
+from .gds_io import GdsPageReader, GdsPageWriter
 from .radix_cache import RadixPrefixCache
 
 logger = init_logger(__name__)
@@ -26,6 +28,7 @@ class PrefixTierStats:
     restore_failures: int = 0
     disk_writes: int = 0
     disk_reads: int = 0
+    gds_reads: int = 0
 
 
 class HostPrefixTier:
@@ -45,6 +48,7 @@ class HostPrefixTier:
         page_size: int,
         capacity_tokens: int,
         disk_dir: str | Path | None = None,
+        use_gds: bool = False,
     ) -> None:
         if page_size <= 0:
             raise ValueError("host prefix tier page_size must be positive")
@@ -68,6 +72,22 @@ class HostPrefixTier:
         self.next_page_id = 0
         self.stats = PrefixTierStats()
         self._warned_restore_failure = False
+        # Raw pages keep the GDS restore path available after a restart even when this
+        # process cannot use GDS; the CPU reader handles the format either way.
+        self.write_raw = bool(use_gds)
+        self._gds: GdsPageReader | None = None
+        self._gds_writer: GdsPageWriter | None = None
+        if use_gds:
+            if gds_io.gds_available():
+                device = torch.device(getattr(pool, "device", "cuda"))
+                if device.type == "cuda":
+                    self._gds = GdsPageReader(device)
+                    self._gds_writer = GdsPageWriter(device)
+            else:
+                logger.warning(
+                    "GPUDirect Storage requested but unavailable (nvidia_fs module or "
+                    "torch support missing); prefix restores use the host path"
+                )
 
     @property
     def capacity_tokens(self) -> int:
@@ -100,6 +120,7 @@ class HostPrefixTier:
             "restore_failures": self.stats.restore_failures,
             "disk_writes": self.stats.disk_writes,
             "disk_reads": self.stats.disk_reads,
+            "gds_reads": self.stats.gds_reads,
             "cached_tokens": self.index.size_info.total_size,
             "host_tokens": self.host_tokens,
             "disk_tokens": self.disk_tokens,
@@ -190,7 +211,7 @@ class HostPrefixTier:
                 )
                 if not torch.equal(row_slice.cpu(), expected[: hi - lo]):
                     raise RuntimeError("host prefix tier page mapping is not contiguous")
-                slabs = self._load_page(page_id)
+                slabs = self._restore_page(page_id)
                 self.pool.scatter_prefix_tier(gpu_locs[lo:hi], slabs)
                 if hi - lo == self.page_size:
                     self._touch_page(page_id)
@@ -265,6 +286,21 @@ class HostPrefixTier:
             self._disk_writes[page_id] = self._disk_pool.submit(self._write_page, page_id, path, slabs)
 
     def _write_page(self, page_id: int, path: Path, slabs: list[torch.Tensor]) -> Path:
+        if self.write_raw:
+            named = {f"slab.{i:04d}": slab for i, slab in enumerate(slabs)}
+            if self._gds_writer is not None:
+                try:
+                    self._gds_writer.write(path, named)
+                except Exception as exc:
+                    # A failed cuFile write falls back to the CPU path so the
+                    # page still lands on disk; the reader consumes either.
+                    logger.warning("GDS page write failed for %s, using CPU path: %r",
+                                   path, exc)
+                    gds_io.write_page(path, named)
+            else:
+                gds_io.write_page(path, named)
+            self.stats.disk_writes += 1
+            return path
         tmp = path.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}.{page_id}")
         torch.save(
             {"version": 1, "page_size": self.page_size, "slabs": slabs},
@@ -273,6 +309,26 @@ class HostPrefixTier:
         os.replace(tmp, path)
         self.stats.disk_writes += 1
         return path
+
+    def _restore_page(self, page_id: int) -> list[torch.Tensor]:
+        """Slabs for a restore, preferring the GPUDirect read when possible.
+
+        An I/O error falls back to the CPU read, which verifies the same
+        checksums - corrupted bytes raise on both paths and never reach the GPU.
+        """
+        if self._gds is not None and page_id not in self.host_pages:
+            path = self.disk_pages.get(page_id)
+            if path is not None:
+                try:
+                    slabs = list(self._gds.read_page(path).values())
+                    self.stats.gds_reads += 1
+                    return slabs
+                except Exception as exc:
+                    logger.warning(
+                        "GDS restore of prefix page %d failed, falling back to CPU: %r",
+                        page_id, exc,
+                    )
+        return self._load_page(page_id)
 
     def _load_page(self, page_id: int) -> list[torch.Tensor]:
         if page_id in self.host_pages:
@@ -284,6 +340,10 @@ class HostPrefixTier:
         path = self.disk_pages.get(page_id)
         if path is None or not path.is_file():
             raise RuntimeError(f"host prefix tier page {page_id} is missing")
+        if gds_io.is_raw_page(path):
+            flat = gds_io.read_page_cpu(path)
+            self.stats.disk_reads += 1
+            return [flat[f"slab.{i:04d}"] for i in range(len(flat))]
         payload = torch.load(path, map_location="cpu", weights_only=True)
         slabs = list(payload["slabs"])
         self.stats.disk_reads += 1
@@ -309,6 +369,12 @@ class HostPrefixTier:
 
     def close(self) -> None:
         self.flush()
+        if self._gds is not None:
+            self._gds.close()
+            self._gds = None
+        if self._gds_writer is not None:
+            self._gds_writer.close()
+            self._gds_writer = None
         self._disk_pool.shutdown(wait=True)
 
 
@@ -318,6 +384,7 @@ def create_host_prefix_tier(
     page_size: int,
     capacity_gib: float,
     disk_dir: str | None = None,
+    use_gds: bool = False,
 ) -> HostPrefixTier | None:
     if capacity_gib <= 0:
         return None
@@ -331,6 +398,7 @@ def create_host_prefix_tier(
         page_size=page_size,
         capacity_tokens=capacity_tokens,
         disk_dir=disk_dir,
+        use_gds=use_gds,
     )
 
 

@@ -114,3 +114,41 @@ def test_cache_manager_restores_host_prefix(tmp_path):
         got_v = pool.v_cache(dense).view(-1, 2, 4)[restored.long()]
         assert torch.equal(got_k.squeeze(1), values[:6] + 100 * dense)
         assert torch.equal(got_v.squeeze(1), values[:6] + 200 * dense)
+
+
+def test_host_prefix_tier_raw_page_roundtrip(tmp_path):
+    from freetoken.kvcache import gds_io
+
+    pool = _pool()
+    ids = _ids([21, 22, 23, 24, 25, 26, 27, 28])
+    locs = torch.arange(8, dtype=torch.int32)
+    expected_k = {}
+    expected_v = {}
+    for dense in range(2):
+        expected_k[dense] = torch.randn(8, 2, 4, dtype=torch.bfloat16) + dense
+        expected_v[dense] = torch.randn(8, 2, 4, dtype=torch.bfloat16) + 10 + dense
+        pool.k_cache(dense).view(-1, 2, 4)[locs] = expected_k[dense]
+        pool.v_cache(dense).view(-1, 2, 4)[locs] = expected_v[dense]
+
+    tier = HostPrefixTier(
+        pool, page_size=2, capacity_tokens=4, disk_dir=tmp_path / "host", use_gds=True
+    )
+    assert tier.put(ids, locs) == 8
+    tier.flush()
+    paths = sorted((tmp_path / "host").glob("page-*.pt"))
+    assert len(paths) == 2
+    assert all(gds_io.is_raw_page(p) for p in paths)
+
+    for dense in range(2):
+        pool.k_cache(dense).fill_(float("nan"))
+        pool.v_cache(dense).fill_(float("nan"))
+    assert tier.get(ids, locs) == 8
+    for dense in range(2):
+        got_k = pool.k_cache(dense).view(-1, 2, 4)[locs.long()]
+        got_v = pool.v_cache(dense).view(-1, 2, 4)[locs.long()]
+        assert torch.equal(got_k, expected_k[dense])
+        assert torch.equal(got_v, expected_v[dense])
+    # No CUDA pool here, so the GDS reader is off and restores use the CPU raw path.
+    assert tier.stats.disk_reads == 2
+    assert tier.stats.gds_reads == 0
+    tier.close()

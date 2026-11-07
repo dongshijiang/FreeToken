@@ -27,6 +27,8 @@ import torch
 
 from freetoken.utils import align_down, init_logger
 
+from .gds_io import GdsPageReader, GdsPageWriter, gds_available
+from . import gds_io
 from .radix_cache import RadixPrefixCache
 
 logger = init_logger(__name__)
@@ -50,14 +52,56 @@ class DSV4PrefixTierStats:
     restore_repeats: int = 0
     disk_writes: int = 0
     disk_reads: int = 0
+    gds_reads: int = 0
     evicted_pages: int = 0
     prefetch_scheduled: int = 0
     prefetch_already_hot: int = 0
+    # Matched pages skipped because the GPU radix already covers them; warming
+    # those would only burn disk reads (and, on a full host tier, re-spill).
+    prefetch_gpu_resident: int = 0
     prefetch_failures: int = 0
     put_ms_total: float = 0.0
     restore_ms_total: float = 0.0
     prefetch_ms_total: float = 0.0
     wait_ms_total: float = 0.0
+
+
+def _payload_to_tensors(payload: dict) -> dict[str, torch.Tensor]:
+    """Flatten a restore-segment payload into zero-padded raw-page names."""
+    out: dict[str, torch.Tensor] = {}
+    window = payload.get("window")
+    if window is not None:
+        for layer, t in enumerate(window):
+            out[f"window.{layer:04d}"] = t
+    for layer, t in payload.get("cmp", {}).items():
+        out[f"cmp.{layer:04d}"] = t
+    for layer, t in payload.get("idx", {}).items():
+        out[f"idx.{layer:04d}"] = t
+    for layer, rings in payload.get("rings", {}).items():
+        for tier_name, t in rings.items():
+            if t is not None:
+                out[f"ring.{tier_name}.{layer:04d}"] = t
+    return out
+
+
+def _payload_from_flat(flat: dict[str, torch.Tensor], n_layers: int) -> dict:
+    """Rebuild the restore-segment payload structure from raw-page names."""
+    window = None
+    if any(name.startswith("window.") for name in flat):
+        window = [flat[f"window.{layer:04d}"] for layer in range(n_layers)]
+    cmp = {
+        int(name.split(".")[1]): t for name, t in flat.items() if name.startswith("cmp.")
+    }
+    idx = {
+        int(name.split(".")[1]): t for name, t in flat.items() if name.startswith("idx.")
+    }
+    rings: dict[int, dict[str, torch.Tensor | None]] = {}
+    for name, t in flat.items():
+        if not name.startswith("ring."):
+            continue
+        _, tier_name, layer = name.split(".")
+        rings.setdefault(int(layer), {})[tier_name] = t
+    return {"window": window, "cmp": cmp, "idx": idx, "rings": rings}
 
 
 def _timed(name: str):
@@ -85,7 +129,8 @@ class DSV4PrefixTier:
 
     def __init__(self, pool, *, page_size: int, capacity_pages: int,
                  disk_dir: str | Path | None = None,
-                 disk_capacity_pages: int | None = None) -> None:
+                 disk_capacity_pages: int | None = None,
+                 use_gds: bool = False) -> None:
         from .dsv4_paged_pool import DSV4PagedKVCache
 
         if not isinstance(pool, DSV4PagedKVCache):
@@ -126,6 +171,20 @@ class DSV4PrefixTier:
         self._prefetch_writes: dict[int, Future] = {}
         self._closed = False
         self._lock = threading.RLock()
+        # Raw pages keep the GDS restore path available after a restart even when this
+        # process cannot use GDS; the CPU reader handles the format either way.
+        self.write_raw = bool(use_gds)
+        self._gds: GdsPageReader | None = None
+        self._gds_writer: GdsPageWriter | None = None
+        if use_gds:
+            if gds_available() and pool._device.type == "cuda":
+                self._gds = GdsPageReader(pool._device)
+                self._gds_writer = GdsPageWriter(pool._device)
+            else:
+                logger.warning(
+                    "GPUDirect Storage requested but unavailable (nvidia_fs module or "
+                    "torch support missing); DSV4 prefix restores use the host path"
+                )
         # The put writer thread gathers pool reads on its OWN CUDA stream, ordered
         # against the engine's commit writes by a per-put ready event (recorded by the
         # scheduler when the put is enqueued) -- not by riding the engine stream, which
@@ -145,20 +204,23 @@ class DSV4PrefixTier:
         return len(self.disk_pages)
 
     def bytes_per_page(self) -> int:
-        """Best-effort byte size of a fully populated restore segment."""
+        """Byte size of a fully populated restore segment."""
         P, device = self.page_size, self.pool._device
         n = 0
         for layer_id in range(self.pool._n_layers):
-            n += self.pool.window_pool[layer_id].element_size() * P
+            win = self.pool.window_pool[layer_id]
+            n += win.element_size() * win[0].numel() * P
             ratio = self.pool.compress_ratios[layer_id]
             if ratio:
-                n += self.pool.cmp_pool[layer_id].element_size() * (P // ratio)
+                cmp_t = self.pool.cmp_pool[layer_id]
+                n += cmp_t.element_size() * cmp_t[0].numel() * (P // ratio)
                 ring = self.pool.state_ring[layer_id]
-                n += ring.buffer[0].numel() * ring.buffer[0].element_size()
+                n += ring.buffer[0].numel() * ring.ring_size * ring.buffer[0].element_size()
                 if ratio == 4:
-                    n += self.pool.idx_pool[layer_id].element_size() * (P // ratio)
+                    idx_t = self.pool.idx_pool[layer_id]
+                    n += idx_t.element_size() * idx_t[0].numel() * (P // ratio)
                     ring = self.pool.indexer_state_ring[layer_id]
-                    n += ring.buffer[0].numel() * ring.buffer[0].element_size()
+                    n += ring.buffer[0].numel() * ring.ring_size * ring.buffer[0].element_size()
         return int(n)
 
     def stats_snapshot(self) -> dict:
@@ -184,6 +246,7 @@ class DSV4PrefixTier:
             "cached_pages": self.index.size_info.total_size // self.page_size,
             "host_pages": len(self.host_pages),
             "disk_pages": len(self.disk_pages),
+            "gds_reads": self.stats.gds_reads,
             "pending_puts": self._pending_puts,
             "capacity_pages": self.capacity_pages,
             "disk_capacity_pages": self.disk_capacity_pages,
@@ -282,17 +345,25 @@ class DSV4PrefixTier:
             self.index.lock_handle(handle, unlock=True)
 
     @_timed("prefetch")
-    def prefetch(self, token_ids: torch.Tensor) -> int:
+    def prefetch(self, token_ids: torch.Tensor, start: int = 0) -> int:
         """Warm disk-resident prefix pages into host RAM before admission.
 
         Scheduling is best-effort and never blocks the caller on disk I/O. A single worker
         keeps page order stable; `get()` remains synchronous and will wait on a prefetch
-        future if it has not completed yet.
+        future if it has not completed yet. Pages fully covered by ``start`` (the length
+        already served by the GPU radix) are skipped: they need no disk read.
         """
         ids = self._cpu(token_ids)
         aligned = align_down(len(ids), self.page_size)
         if aligned == 0:
             return 0
+        # FT_PREFIX_TIER_PREFETCH=0 keeps disk reads off the async prefetch
+        # worker so a restore pays its own disk latency synchronously; the GDS
+        # A/B benchmark needs that, since the prefetch otherwise wins the race
+        # and decides which pages go through cuFile.
+        if os.environ.get("FT_PREFIX_TIER_PREFETCH", "1") == "0":
+            return 0
+        gpu_through = align_down(int(start), self.page_size)
         scheduled = 0
         with self._lock:
             if self._closed:
@@ -305,6 +376,9 @@ class DSV4PrefixTier:
             try:
                 rows = handle.get_matched_indices()
                 for lo in range(0, matched, self.page_size):
+                    if lo + self.page_size <= gpu_through:
+                        self.stats.prefetch_gpu_resident += 1
+                        continue
                     page_id = int(rows[lo].item()) // self.page_size
                     if page_id in self.host_pages or page_id in self._prefetch_writes:
                         self.stats.prefetch_already_hot += 1
@@ -595,12 +669,32 @@ class DSV4PrefixTier:
                     lo = page_idx * self.page_size
                     hi = lo + self.page_size
                     page_id = int(rows[lo].item()) // self.page_size
-                    payload = self._load_page(page_id)
+                    payload = self._restore_page(page_id)
                     self.pool.scatter_prefix_page(full_locs[lo:hi], payload)
                     self.stats.restore_pages += 1
                 return target
             finally:
                 self.index.lock_handle(handle, unlock=True)
+
+    def _restore_page(self, page_id: int) -> dict:
+        """A restore-segment payload, preferring the GPUDirect read when possible.
+
+        An I/O error falls back to the CPU read, which verifies the same
+        checksums - corrupted bytes raise on both paths and never reach the GPU.
+        """
+        if self._gds is not None and page_id not in self.host_pages:
+            path = self.disk_pages.get(page_id)
+            if path is not None:
+                try:
+                    flat = self._gds.read_page(path)
+                    self.stats.gds_reads += 1
+                    return _payload_from_flat(flat, self.pool._n_layers)
+                except Exception as exc:
+                    logger.warning(
+                        "GDS restore of DSV4 prefix page %d failed, falling back to CPU: %r",
+                        page_id, exc,
+                    )
+        return self._load_page(page_id)
 
     def evict(self, pages: int) -> int:
         pages = max(0, min(int(pages), self.index.size_info.evictable_size // self.page_size))
@@ -651,18 +745,27 @@ class DSV4PrefixTier:
         for future in futures:
             future.result()
         # Host-resident pages are not crash-durable. On orderly shutdown, spill them too so
-        # a restarted server can reconstruct the full disk-backed index.
+        # a restarted server can reconstruct the full disk-backed index. Pages already
+        # spilled keep their (immutable) disk copy; rewriting them is pure waste.
         if self.disk_dir is not None:
             for page_id, payload in list(self.host_pages.items()):
+                self.host_pages.pop(page_id, None)
+                if page_id in self.disk_pages:
+                    continue
                 path = self.disk_dir / f"page-{page_id:016x}.pt"
                 self.disk_pages[page_id] = path
                 self._disk_writes[page_id] = self._disk_pool.submit(
                     self._write_page, page_id, path, payload
                 )
-                self.host_pages.pop(page_id, None)
         self.flush()
         self._prefetch_pool.shutdown(wait=True)
         self._disk_pool.shutdown(wait=True)
+        if self._gds is not None:
+            self._gds.close()
+            self._gds = None
+        if self._gds_writer is not None:
+            self._gds_writer.close()
+            self._gds_writer = None
 
     def pool_signature(self) -> dict:
         """Layout fingerprint persisted with every page; prevents cross-model restores."""
@@ -691,7 +794,7 @@ class DSV4PrefixTier:
         for metadata_path in sorted(self.disk_dir.glob("page-*.json")):
             try:
                 meta = json.loads(metadata_path.read_text())
-                if meta.get("version") != 2:
+                if meta.get("version") not in (2, gds_io.FORMAT_VERSION):
                     raise ValueError("unsupported metadata version")
                 if meta.get("page_size") != self.page_size:
                     raise ValueError("page size mismatch")
@@ -747,7 +850,7 @@ class DSV4PrefixTier:
                 "parent_page_id": meta.get("parent_page_id"),
                 "has_window": bool(meta.get("has_window", False)),
             }
-            self.checksums[page_id] = meta["checksum"]
+            self.checksums[page_id] = meta.get("checksum")
             next_page_id = max(next_page_id, page_id + 1)
             loaded += 1
         self.next_page_id = max(self.next_page_id, next_page_id)
@@ -760,10 +863,13 @@ class DSV4PrefixTier:
 
     def _warm_page(self, page_id: int) -> None:
         try:
+            # Load outside the lock: this is a full disk read, and holding the
+            # tier lock across it would stall get()/put() on the only prefetch
+            # worker's I/O.
+            payload = self._load_page(page_id)
             with self._lock:
                 if self._closed or page_id in self.host_pages:
                     return
-                payload = self._load_page(page_id)
                 self._ensure_host_capacity(1)
                 self.host_pages[page_id] = payload
                 self._touch_page(page_id)
@@ -816,6 +922,12 @@ class DSV4PrefixTier:
                 )
             self._ensure_disk_capacity(extra_pages)
             page_id, payload = self.host_pages.popitem(last=False)
+            if page_id in self.disk_pages:
+                # A spilled page's bytes are immutable and its disk copy is
+                # current, so evicting the host copy needs no write. Re-spilling
+                # turned every warm cycle of a full host tier into a full extra
+                # pass of disk writes over pages that were already on disk.
+                continue
             path = self.disk_dir / f"page-{page_id:016x}.pt"
             self.disk_pages[page_id] = path
             self._disk_writes[page_id] = self._disk_pool.submit(
@@ -824,6 +936,10 @@ class DSV4PrefixTier:
 
     def _write_page(self, page_id: int, path: Path, payload: dict) -> Path:
         meta = self.page_metadata[page_id]
+        if self.write_raw:
+            self._write_raw_page(page_id, path, payload, meta)
+            self.stats.disk_writes += 1
+            return path
         checksum = _checksum_payload(payload)
         tmp = path.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}.{page_id}")
         torch.save(
@@ -840,13 +956,41 @@ class DSV4PrefixTier:
             "has_window": bool(meta.get("has_window", False)),
             "checksum": checksum,
         }
-        metadata_tmp = path.with_suffix(f".meta.tmp.{os.getpid()}.{page_id}")
-        metadata_tmp.write_text(json.dumps(metadata, sort_keys=True))
-        metadata_path = path.with_suffix(".json")
-        os.replace(metadata_tmp, metadata_path)
+        self._write_metadata(path, metadata)
         self.checksums[page_id] = checksum
         self.stats.disk_writes += 1
         return path
+
+    def _write_raw_page(self, page_id: int, path: Path, payload: dict, meta: dict) -> None:
+        tensors = _payload_to_tensors(payload)
+        if self._gds_writer is not None:
+            try:
+                self._gds_writer.write(path, tensors)
+            except Exception as exc:
+                # A failed cuFile write falls back to the CPU path so the page
+                # still lands on disk; the reader consumes either format.
+                logger.warning("GDS page write failed for %s, using CPU path: %r",
+                               path, exc)
+                gds_io.write_page(path, tensors)
+        else:
+            gds_io.write_page(path, tensors)
+        metadata = {
+            "version": gds_io.FORMAT_VERSION,
+            "format": "raw",
+            "page_size": self.page_size,
+            "pool_signature": self.pool_signature(),
+            "page_id": page_id,
+            "token_ids": meta["token_ids"],
+            "parent_page_id": meta.get("parent_page_id"),
+            "has_window": bool(meta.get("has_window", False)),
+        }
+        self._write_metadata(path, metadata)
+
+    def _write_metadata(self, path: Path, metadata: dict) -> None:
+        metadata_tmp = path.with_suffix(f".meta.tmp.{os.getpid()}.{threading.get_ident()}")
+        metadata_tmp.write_text(json.dumps(metadata, sort_keys=True))
+        metadata_path = path.with_suffix(".json")
+        os.replace(metadata_tmp, metadata_path)
 
     def _load_page(self, page_id: int) -> dict:
         pending = self._disk_writes.get(page_id)
@@ -858,6 +1002,10 @@ class DSV4PrefixTier:
         path = self.disk_pages.get(page_id)
         if path is None or not path.is_file():
             raise RuntimeError(f"DSV4 prefix tier page {page_id} is missing")
+        if gds_io.is_raw_page(path):
+            flat = gds_io.read_page_cpu(path)
+            self.stats.disk_reads += 1
+            return _payload_from_flat(flat, self.pool._n_layers)
         wrapper = torch.load(path, map_location="cpu", weights_only=True)
         if wrapper.get("version") != 2:
             raise RuntimeError("unsupported DSV4 HiCache payload version")
@@ -920,12 +1068,13 @@ def _checksum_payload(payload) -> str:
 
 def create_dsv4_prefix_tier(pool, *, capacity_gib: float,
                             disk_dir: str | None = None,
-                            disk_capacity_gib: float = 0.0) -> DSV4PrefixTier | None:
+                            disk_capacity_gib: float = 0.0,
+                            use_gds: bool = False) -> DSV4PrefixTier | None:
     """Create a DSV4 tier from host/SSD budgets. Page byte size is exact for the pool."""
     if capacity_gib <= 0:
         return None
     probe = DSV4PrefixTier(
-        pool, page_size=pool.P, capacity_pages=1, disk_dir=disk_dir
+        pool, page_size=pool.P, capacity_pages=1, disk_dir=disk_dir, use_gds=use_gds
     )
     bytes_per_page = probe.bytes_per_page()
     probe.capacity_pages = max(

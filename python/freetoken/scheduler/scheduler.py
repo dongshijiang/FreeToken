@@ -597,12 +597,14 @@ class Scheduler(SchedulerIOMixin):
                 capacity_gib=config.host_prefix_cache_gib,
                 disk_dir=disk_dir,
                 disk_capacity_gib=config.host_prefix_cache_disk_gib,
+                use_gds=config.host_prefix_cache_gds,
             )
         return create_host_prefix_tier(
             pool,
             page_size=config.page_size,
             capacity_gib=config.host_prefix_cache_gib,
             disk_dir=disk_dir,
+            use_gds=config.host_prefix_cache_gds,
         )
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
