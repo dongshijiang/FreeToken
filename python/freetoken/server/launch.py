@@ -122,10 +122,10 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
         if hasattr(signal, "SIGHUP"):
             signal.signal(signal.SIGHUP, _terminate_to_keyboard)
 
+        logger = init_logger(__name__)
         try:
             scheduler.run_forever()
         except KeyboardInterrupt:
-            logger = init_logger(__name__)
             if args.tp_info.is_primary():
                 print()  # for a clean newline after ^C
                 logger.info("Scheduler exiting gracefully...")

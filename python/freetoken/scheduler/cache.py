@@ -787,6 +787,11 @@ class CacheManager:
         host = self.host_prefix_cache
         if host is None or not getattr(host, "supports_dsv4", False) or insert_len <= 0:
             return
+        if os.environ.get("FREETOKEN_SKIP_DSV4_HOST_PUT"):
+            # Diagnostic switch: serve with the host tier matching enabled but all
+            # write-through disabled, to attribute TTFT overhead between the put
+            # path and the match/restore machinery.
+            return
         try:
             if (
                 getattr(host, "supports_async", False)

@@ -203,12 +203,24 @@ class DSV4PagedKVCache(BaseKVCachePool):
         self.full_to_window = torch.full(
             (sizes.full_token + 1,), -1, dtype=torch.int64, device=device
         )
-        # Reusable pinned staging buffers for host gathers, keyed by (shape, dtype).
-        # Pageable .cpu() copies stage through a driver bounce buffer and serialize per
-        # copy; pinned + non_blocking + one stream sync at the end lets the (few) big
-        # copies share the copy engine with the engine's own H2D traffic instead of
-        # round-tripping a host sync per tensor.
+        # Pinned staging buffers for host gathers, recycled through a free list: an
+        # async put's pinned copy may still be in flight (its consumer clones the
+        # payload on the writer thread) when the next put is issued, so buffers must
+        # not be reused until the consumer releases them.
+        self._pinned_free: list[torch.Tensor] = []
+        self._event_free: list[torch.cuda.Event] = []
+        self._gpu_pack_bufs: dict[int, torch.Tensor] = {}
+        # Per-shape pinned staging for the synchronous per-slice gather (the packed
+        # single-copy variant wedged the driver; see gather_prefix_pages).
         self._pinned_bufs: dict[tuple, torch.Tensor] = {}
+        # Consumed gather packs queued by the writer for the SCHEDULER to recycle:
+        # freeing a pinned tensor touches PyTorch's CachingHostAllocator, which
+        # submits CUDA calls (cudaEventCreate/Record for every stream recorded on
+        # the storage -- the non_blocking D2H records the gather stream). A CUDA
+        # submission from the writer deadlocks the driver against the engine's own
+        # submissions (observed five times: engine wedged in cuMemcpyHtoDAsync while
+        # the writer blocked in CachingHostAllocator free -> cuEventCreate).
+        self._pack_recycle: list[dict] = []
 
         # The ONE slot map (table_idx, pos) -> full loc: the shared page_table, attached by the
         # engine policy. Window slots come from ``full_to_window``; cmp/idx rows are arithmetic.
@@ -648,14 +660,90 @@ class DSV4PagedKVCache(BaseKVCachePool):
         return {"window": window, "cmp": cmp, "idx": idx, "rings": rings}
 
     def gather_prefix_pages(self, full_locs: torch.Tensor) -> list[dict]:
-        """Batched gather of n whole pages: one contiguity check on CPU (zero GPU
-        syncs), one indexed read of ``full_to_window``, then per-layer slices over the
-        whole run -- ~2*n_layers+2 GPU ops instead of ~15 per page. The caller passes
-        CPU int64 locs (frozen at enqueue). Falls back to the per-page gather when the
-        run's window slots are not one contiguous bound range (rare: freshly committed
-        suffixes allocate full+window pages as one sequential run)."""
-        P = self.P
+        """Synchronous gather of n whole pages: per-slice non_blocking D2H into
+        per-shape pinned buffers on the current stream, then ONE stream sync and a
+        clone into regular host memory. This is the implementation that passed the
+        full 3-pass benchmark 60/60 before packing; the packed single-staging-copy
+        variant wedged the driver six times (engine thread blocked forever inside
+        cuMemcpyHtoDAsync for an unrelated pageable H2D, L8192xC8 only) and was
+        reverted -- do not reintroduce GPU->GPU packing or cross-thread event
+        handoff here without re-running that cell as the gate."""
         locs = full_locs.detach().to("cpu", dtype=torch.int64).contiguous()
+        ticket = self._plan_prefix_run(locs)
+        if self._device.type != "cuda":
+            host = {tag: src.detach().cpu().clone() for src, tag in ticket["slices"]}
+            return self._build_prefix_pages(host, ticket)
+        host: dict[str, torch.Tensor] = {}
+        for src, tag in ticket["slices"]:
+            key = (tuple(src.shape), src.dtype)
+            buf = self._pinned_bufs.get(key)
+            if buf is None:
+                if len(self._pinned_bufs) > 32:
+                    self._pinned_bufs.clear()  # rare: many run lengths; drop and rebuild
+                buf = torch.empty(tuple(src.shape), dtype=src.dtype, pin_memory=True)
+                self._pinned_bufs[key] = buf
+            buf.copy_(src.detach(), non_blocking=True)
+            host[tag] = buf
+        torch.cuda.current_stream(self._device).synchronize()
+        return self._build_prefix_pages(host, ticket)
+
+    def issue_gather_pages(self, full_locs: torch.Tensor) -> dict:
+        """UNUSED (kept for reference only): the packed issue/complete split wedged
+        the driver six times -- the serving path now calls gather_prefix_pages, the
+        synchronous per-slice gather that passed the 3-pass benchmark 60/60.
+        plan the run, slice the sources, pack them GPU->GPU into one staging tensor,
+        enqueue ONE pinned D2H and record the done event. Returns a ticket the writer
+        thread completes with build_gather_pages. No host wait except the single tiny
+        ``full_to_window`` D2H inside _plan_prefix_run."""
+        ticket = self._plan_prefix_run(
+            full_locs.detach().to("cpu", dtype=torch.int64).contiguous()
+        )
+        if self._device.type != "cuda":
+            ticket["host"] = {tag: src.detach().cpu().clone()
+                              for src, tag in ticket["slices"]}
+            return ticket
+        ticket["pack"] = self._issue_pack(ticket["slices"])
+        return ticket
+
+    def build_gather_pages(self, ticket: dict) -> list[dict]:
+        """COMPLETE half (writer thread): wait for the done event, reassemble the
+        per-page payloads from the pinned pack, and queue the pack for the scheduler
+        to recycle (see _pack_recycle -- the writer must not free pinned memory, let
+        alone submit CUDA). Pure CPU except the cudaEventSynchronize, which is a
+        wait-side call and never takes the submission locks the engine thread holds."""
+        pack = ticket.get("pack")
+        if pack is not None:
+            try:
+                pack["done"].synchronize()
+                host = {tag: pack["pinned"][off:off + nbytes].view(dtype).view(shape)
+                        for off, nbytes, shape, dtype, tag in pack["plan"]}
+                return self._build_prefix_pages(host, ticket)
+            finally:
+                # Queue BEFORE anything can raise further: the payloads are CPU
+                # clones, so recycling the storage once drained is always safe.
+                self._pack_recycle.append(pack)
+        return self._build_prefix_pages(ticket["host"], ticket)
+
+    def drain_pack_recycle(self) -> None:
+        """SCHEDULER thread: return consumed gather packs to the pinned/event free
+        lists. Any pinned tensor that drops off here (or off a full free list) is
+        deallocated on the scheduler thread, the process's only CUDA submitter."""
+        while self._pack_recycle:
+            pack = self._pack_recycle.pop()
+            self._release_pinned(pack["pinned"])
+            self._release_event(pack["done"])
+
+    def _plan_prefix_run(self, locs: torch.Tensor) -> dict:
+        """Slice a contiguous run of n whole pages into per-layer sources.
+
+        One contiguity check on CPU, one indexed read of ``full_to_window`` (the ONLY
+        device sync), then per-layer slices over the whole run -- ~2*n_layers+2 GPU
+        ops instead of ~15 per page. The caller passes CPU int64 locs. Falls back to
+        per-page slices when the run's window slots are not one contiguous bound range
+        (rare: freshly committed suffixes allocate full+window pages as one
+        sequential run) -- the fallback still needs no further device sync because the
+        per-page window slots are already in hand."""
+        P = self.P
         n = locs.numel() // P
         assert n >= 1 and locs.numel() % P == 0
         base0 = int(locs[0])
@@ -668,91 +756,189 @@ class DSV4PagedKVCache(BaseKVCachePool):
         if not all(0 <= ws_list[i] == ws_list[0] + i * P for i in range(n)) or any(
             ratio and (P % ratio or base0 % ratio) for ratio in self.compress_ratios
         ):
-            # Scattered/unbound window pages or unaligned compressed rows: slow path.
-            return [self.gather_prefix_page(locs[i * P:(i + 1) * P]) for i in range(n)]
+            # Scattered/unbound window pages or unaligned compressed rows: per-page slices.
+            slices: list[tuple[torch.Tensor, str]] = []
+            layouts: list[dict] = []
+            for i in range(n):
+                base = base0 + i * P
+                ws = ws_list[i]
+                layout: dict = {"window": ws >= 0, "cmp": {}, "idx": {}, "rings": {}}
+                if ws >= 0:
+                    for layer_id in range(self._n_layers):
+                        slices.append(
+                            (self.window_pool[layer_id][ws:ws + P], f"p{i}:win:{layer_id}"))
+                for layer_id, ratio in enumerate(self.compress_ratios):
+                    if not ratio:
+                        continue
+                    r0, r1 = base // ratio, (base + P) // ratio
+                    layout["cmp"][layer_id] = r1 - r0
+                    slices.append((self.cmp_pool[layer_id][r0:r1], f"p{i}:cmp:{layer_id}"))
+                    if ratio == 4:
+                        layout["idx"][layer_id] = r1 - r0
+                        slices.append((self.idx_pool[layer_id][r0:r1], f"p{i}:idx:{layer_id}"))
+                    for tier, attr in (("attn", "state_ring"), ("idx", "indexer_state_ring")):
+                        ring = getattr(self, attr)[layer_id]
+                        if ring is None or ws < 0:
+                            layout["rings"][(layer_id, tier)] = None
+                            continue
+                        layout["rings"][(layer_id, tier)] = ring.ring_size
+                        block_base = (ws // P) * ring.ring_size
+                        slices.append(
+                            (ring.buffer[block_base:block_base + ring.ring_size],
+                             f"p{i}:ring:{layer_id}:{tier}"))
+                layouts.append(layout)
+            return {"slices": slices, "fast": False, "n": n, "layouts": layouts}
 
         span = n * P
-        win_span = ws_list[0] + span
-
-        def fetch(src: torch.Tensor, pending: list) -> torch.Tensor:
-            """Schedule a D2H copy of ``src`` into a pinned staging buffer (non_blocking
-            on the current stream) and return the staging tensor; the caller must call
-            ``flush()`` before READING anything it returned. CPU sources are cloned
-            directly."""
-            if not (src.is_cuda and self._device.type == "cuda"):
-                return src.detach().cpu().clone()
-            key = (tuple(src.shape), src.dtype)
-            buf = self._pinned_bufs.get(key)
-            if buf is None:
-                if len(self._pinned_bufs) > 32:
-                    self._pinned_bufs.clear()  # rare: many run lengths; drop and rebuild
-                buf = torch.empty(tuple(src.shape), dtype=src.dtype, pin_memory=True)
-                self._pinned_bufs[key] = buf
-            buf.copy_(src.detach(), non_blocking=True)
-            pending.append(buf)
-            return buf
-
-        pending: list[torch.Tensor] = []
-
-        def flush() -> None:
-            if pending:
-                torch.cuda.current_stream(self._device).synchronize()
-                pending.clear()
-
-        windows: list[list[torch.Tensor]] = []
+        ws0 = ws_list[0]
+        slices = []
         for layer_id in range(self._n_layers):
-            big = fetch(self.window_pool[layer_id][ws_list[0]:win_span], pending)
-            windows.append([big[i * P:(i + 1) * P] for i in range(n)])
-
-        cmp_all: dict[int, list[torch.Tensor]] = {}
-        idx_all: dict[int, list[torch.Tensor]] = {}
-        ring_all: dict[int, dict[str, list[torch.Tensor] | None]] = {}
+            slices.append((self.window_pool[layer_id][ws0:ws0 + span], f"win:{layer_id}"))
         per_page: dict[int, int] = {}
+        ring_sizes: dict[tuple[int, str], int] = {}
         for layer_id, ratio in enumerate(self.compress_ratios):
             if not ratio:
                 continue
+            per_page[layer_id] = P // ratio
             row0 = base0 // ratio
             rows_n = (base0 + span) // ratio - row0
-            big_cmp = fetch(self.cmp_pool[layer_id][row0:row0 + rows_n], pending)
-            per_page[layer_id] = P // ratio
-            cmp_all[layer_id] = [big_cmp[i * per_page[layer_id]:(i + 1) * per_page[layer_id]]
-                                 for i in range(n)]
+            slices.append((self.cmp_pool[layer_id][row0:row0 + rows_n], f"cmp:{layer_id}"))
             if ratio == 4:
-                big_idx = fetch(self.idx_pool[layer_id][row0:row0 + rows_n], pending)
-                idx_all[layer_id] = [big_idx[i * per_page[layer_id]:(i + 1) * per_page[layer_id]]
-                                     for i in range(n)]
-            ring_all[layer_id] = {}
+                slices.append((self.idx_pool[layer_id][row0:row0 + rows_n], f"idx:{layer_id}"))
             for tier, attr in (("attn", "state_ring"), ("idx", "indexer_state_ring")):
                 ring = getattr(self, attr)[layer_id]
                 if ring is None:
-                    ring_all[layer_id][tier] = None
                     continue
-                block_base = (ws_list[0] // P) * ring.ring_size
-                big = fetch(ring.buffer[block_base:block_base + n * ring.ring_size], pending)
-                ring_all[layer_id][tier] = [big[i * ring.ring_size:(i + 1) * ring.ring_size]
-                                            for i in range(n)]
-        flush()
+                ring_sizes[(layer_id, tier)] = ring.ring_size
+                block_base = (ws0 // P) * ring.ring_size
+                slices.append((ring.buffer[block_base:block_base + n * ring.ring_size],
+                               f"ring:{layer_id}:{tier}"))
+        return {"slices": slices, "fast": True, "n": n, "per_page": per_page,
+                "ring_sizes": ring_sizes, "n_layers": self._n_layers}
 
+    def _build_prefix_pages(self, host: dict[str, torch.Tensor],
+                            ticket: dict) -> list[dict]:
+        """Reassemble per-page payloads from host views (writer thread, pure CPU).
+        Every returned tensor is a fresh clone -- the pinned source may be recycled
+        as soon as this returns."""
+        P = self.P
         pages: list[dict] = []
-        for i in range(n):
-            # The staging buffers are reused by the next gather: each page's chunks are
-            # views into them, so clone once here (cheap host memcpy) to own the data.
-            cmp_i = {layer: chunks[i].clone() for layer, chunks in cmp_all.items()}
-            idx_i = {layer: chunks[i].clone() for layer, chunks in idx_all.items()}
-            rings_i = {}
-            for layer, tiers in ring_all.items():
-                if tiers is None:
-                    rings_i[layer] = None
-                    continue
-                rings_i[layer] = {
-                    tier: (chunks[i].clone() if chunks is not None else None)
-                    for tier, chunks in tiers.items()
-                }
-            pages.append({
-                "window": [windows[layer_id][i].clone() for layer_id in range(self._n_layers)],
-                "cmp": cmp_i, "idx": idx_i, "rings": rings_i,
-            })
+        if ticket["fast"]:
+            n = ticket["n"]
+            per_page = ticket["per_page"]
+            ring_sizes = ticket["ring_sizes"]
+            n_layers = ticket["n_layers"]
+            for i in range(n):
+                cmp_i = {layer: host[f"cmp:{layer}"][i * per_page[layer]:(i + 1) * per_page[layer]].clone()
+                         for layer in per_page}
+                idx_i = {layer: host[f"idx:{layer}"][i * per_page[layer]:(i + 1) * per_page[layer]].clone()
+                         for layer in per_page if f"idx:{layer}" in host}
+                rings_i: dict[int, dict[str, torch.Tensor | None]] = {}
+                for (layer_id, tier), ring_size in ring_sizes.items():
+                    h = host[f"ring:{layer_id}:{tier}"]
+                    rings_i.setdefault(layer_id, {})[tier] = (
+                        h[i * ring_size:(i + 1) * ring_size].clone())
+                for layer_id, ratio in enumerate(self.compress_ratios):
+                    if not ratio:
+                        continue
+                    tiers = rings_i.setdefault(layer_id, {})
+                    for tier in ("attn", "idx"):
+                        tiers.setdefault(tier, None)
+                pages.append({
+                    "window": [host[f"win:{layer_id}"][i * P:(i + 1) * P].clone()
+                               for layer_id in range(n_layers)],
+                    "cmp": cmp_i, "idx": idx_i, "rings": rings_i,
+                })
+            return pages
+        for i, layout in enumerate(ticket["layouts"]):
+            window = ([host[f"p{i}:win:{layer_id}"].clone()
+                       for layer_id in range(self._n_layers)]
+                      if layout["window"] else None)
+            cmp_i = {layer: host[f"p{i}:cmp:{layer}"].clone() for layer in layout["cmp"]}
+            idx_i = {layer: host[f"p{i}:idx:{layer}"].clone() for layer in layout["idx"]}
+            rings_i: dict[int, dict[str, torch.Tensor | None]] = {}
+            for (layer_id, tier), size in layout["rings"].items():
+                tiers = rings_i.setdefault(layer_id, {})
+                if size is None:
+                    tiers[tier] = None
+                else:
+                    tiers[tier] = host[f"p{i}:ring:{layer_id}:{tier}"].clone()
+            pages.append({"window": window, "cmp": cmp_i, "idx": idx_i,
+                          "rings": rings_i})
         return pages
+
+    def _issue_pack(self, slices: list[tuple[torch.Tensor, str]]) -> dict:
+        """Pack every slice into one GPU uint8 staging tensor with ONE pinned D2H at
+        the end, all on the CURRENT stream (the put gather stream), all async.
+
+        The GPU->GPU packing intentionally does NOT go through the copy engines:
+        ``mul(src, 1, out=dst)`` runs an elementwise kernel on the SMs instead. At
+        KV-pool pressure >0.96 the copy-engine path wedged the driver three times
+        (the scheduler thread blocked forever inside cuMemcpyHtoDAsync while another
+        thread was in cuLaunchKernel/cuEventDestroy on the same device), while the
+        pre-packing builds that used pageable D2Hs ran 60/60. One CE entry for the
+        final pinned D2H stays; the big staging copies cost ~1ms of SM time instead.
+
+        Returns the plan/pinned/done ticket for build_gather_pages."""
+        ALIGN = 256  # keeps every byte offset element-alignable for .view(dtype)
+        plan: list[tuple[int, int, tuple, torch.dtype, str]] = []
+        off = 0
+        for src, tag in slices:
+            nbytes = src.numel() * src.element_size()
+            plan.append((off, nbytes, tuple(src.shape), src.dtype, tag))
+            off += (nbytes + ALIGN - 1) // ALIGN * ALIGN
+        stream = torch.cuda.current_stream(self._device)
+        staging = self._gpu_pack_bufs.get(off)
+        if staging is None:
+            if len(self._gpu_pack_bufs) > 8:
+                self._gpu_pack_bufs.clear()  # rare: many run lengths; drop and rebuild
+            staging = torch.empty(off, dtype=torch.uint8, device=self._device)
+            self._gpu_pack_bufs[off] = staging
+        # the cache holds the only ref; if evicted while copies are in flight, the
+        # allocator must not hand the blocks to another stream's allocation
+        staging.record_stream(stream)
+        for (off_i, nbytes, _shape, _dtype, _tag), (src, _) in zip(plan, slices):
+            src = src.detach()
+            if not src.is_contiguous():
+                src = src.contiguous()
+            dst = staging[off_i:off_i + nbytes].view(_dtype)
+            # SM copy: x*1 == x bit-exact for every pool dtype (bf16/fp32/int)
+            torch.mul(src.reshape(-1), 1, out=dst.reshape(-1))
+        pinned = self._acquire_pinned(off)
+        # copy_ requires equal shapes: a recycled buffer may be larger than this
+        # pack, so slice it to the pack size first
+        pinned[:off].copy_(staging[:off], non_blocking=True)
+        done = self._acquire_event()
+        done.record(stream)
+        return {"plan": plan, "pinned": pinned, "done": done}
+
+    def _acquire_pinned(self, nbytes: int) -> torch.Tensor:
+        for i, buf in enumerate(self._pinned_free):
+            if buf.numel() >= nbytes:
+                return self._pinned_free.pop(i)
+        return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+
+    def _release_pinned(self, buf: torch.Tensor) -> None:
+        if len(self._pinned_free) < 8:
+            self._pinned_free.append(buf)
+
+    def _acquire_event(self) -> "torch.cuda.Event":
+        """Recycled done events: an Event object GC'd on the writer thread calls
+        cuEventDestroy -- a driver call we want off that thread entirely (and the
+        reclaim race was another suspect in the driver wedges)."""
+        if self._event_free:
+            return self._event_free.pop()
+        return torch.cuda.Event()
+
+    def _release_event(self, ev: "torch.cuda.Event") -> None:
+        # Deliberately UNBOUNDED: capping the free list made every release past the
+        # cap drop the event, so it was GC'd -- and cuEventDestroy'd -- on the writer
+        # thread, one driver call there too many during the channel-starvation wedge.
+        # Events are ~100 bytes of host state; the pool only grows to peak in-flight
+        # puts. An event still tracked in the tier's _gather_inflight deque can be
+        # recycled and re-recorded: the tier prunes its deque before acquiring, and a
+        # re-recorded alias only makes a deque wait more conservative, never shorter.
+        self._event_free.append(ev)
 
     def scatter_prefix_page(self, full_locs: torch.Tensor, payload: dict) -> None:
         P = self.P

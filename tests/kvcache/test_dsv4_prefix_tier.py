@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 import torch
 
@@ -689,10 +691,12 @@ def test_put_async_drops_stale_generation(tmp_path):
     pool.alloc_swa(full)
     ids = torch.arange(P, dtype=torch.int32)
     # Direct writer-side entry with a generation from a future clear: dropped.
-    assert tier._put_sync(ids, full, P, generation=tier._generation + 1) == 0
+    job = tier._issue_put(ids.clone(), full, None, None, tier._generation + 1)
+    assert tier._complete_put(job) == 0
     assert tier.stats.put_requests == 0 and tier.host_pages_count == 0
     # Current generation stores normally.
-    assert tier._put_sync(ids, full, P) == P
+    job = tier._issue_put(ids.clone(), full, None, None, tier._generation)
+    assert tier._complete_put(job) == P
     assert tier.host_pages_count == 1
 
 
@@ -721,6 +725,16 @@ def test_cache_manager_async_put_pins_and_restores(tmp_path):
         output_len=0, uid=0, sampling_params=SamplingParams(), cache_handle=handle,
     )
     req.device_len = len(ids)
+    # Hold the writer mid-put so the in-flight assertions below are deterministic
+    # (the put itself completes in microseconds on the CPU-device pool).
+    gate = threading.Event()
+    real_complete = tier._complete_put
+
+    def gated_complete(job):
+        gate.wait(timeout=30)
+        return real_complete(job)
+
+    tier._complete_put = gated_complete
     cm.lock(handle)
     cm.allocate_paged([req])
     req.cached_len = len(ids)
@@ -730,6 +744,9 @@ def test_cache_manager_async_put_pins_and_restores(tmp_path):
     # While the put is in flight the committed path is pinned against eviction...
     assert tier.pending_puts == 1
     assert cm.prefix_cache.full_protected >= 2 * P
+    # ...and once the writer finished and the request's own handle unlocked, the
+    # scheduler-thread drain leaves no protected ref behind.
+    gate.set()
     # ...and once the writer finished and the request's own handle unlocked, the
     # scheduler-thread drain leaves no protected ref behind.
     cm.unlock(req.cache_handle)
