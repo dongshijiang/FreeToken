@@ -702,7 +702,7 @@ class DSV4PrefixTier:
                             continue  # an earlier put already inserted this page
                         end = start + self.page_size
                         payload["token_ids"] = ids[start:end].clone()
-                        self._ensure_host_capacity(1)
+                        self._ensure_host_capacity(1, protect=len(new_rows) // self.page_size)
                         page_id = self._allocate_page_ids(1)[0]
                         self.host_pages[page_id] = payload
                         self.page_metadata[page_id] = {
@@ -1027,14 +1027,24 @@ class DSV4PrefixTier:
                     f"{self.disk_capacity_pages} pages) and has no evictable prefix"
                 )
 
-    def _ensure_host_capacity(self, extra_pages: int) -> None:
+    def _ensure_host_capacity(self, extra_pages: int, protect: int = 0) -> None:
+        """``protect``: pages the CALLER has already inserted for its own in-flight
+        put -- drop-eviction must never eat the prefix it is currently building
+        (only reachable when capacity < pages-per-put)."""
         while len(self.host_pages) + extra_pages > self.capacity_pages:
             if not self.host_pages:
                 raise RuntimeError("DSV4 host prefix tier has no evictable page")
             if self.disk_dir is None:
-                raise RuntimeError(
-                    "DSV4 host prefix tier is full; set --host-prefix-cache-dir to spill"
-                )
+                # No disk backing: evict drop-style, SGLang HiCache semantics. The
+                # host tier is a pure cache -- dropping the oldest prefix costs a
+                # recompute on its next use but never blocks (or poisons) the write
+                # path. Refusing to evict made every put past a full tier pay the
+                # full gather and then fail at insert, inflating TTFT on replay
+                # workloads (pass2ON small cells +40-160%).
+                evictable = self.index.size_info.evictable_size // self.page_size
+                if evictable <= protect or self.evict(extra_pages) == 0:
+                    raise RuntimeError("DSV4 host prefix tier has no evictable page")
+                continue
             self._ensure_disk_capacity(extra_pages)
             page_id, payload = self.host_pages.popitem(last=False)
             if page_id in self.disk_pages:

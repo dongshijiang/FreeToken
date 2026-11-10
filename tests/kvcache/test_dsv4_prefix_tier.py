@@ -999,3 +999,31 @@ def test_dsv4_prefix_tier_prefetch_skips_gpu_resident_pages(tmp_path):
     tier.wait_prefetch(ids[P:])
     assert tier.stats.prefetch_scheduled == 2
     assert tier.stats.prefetch_gpu_resident == 3
+def test_full_host_tier_without_disk_dir_evicts_drop_style():
+    """SGLang semantics: with no disk backing, a full host tier evicts the oldest
+    prefix (LRU, drop) instead of failing the put -- the write path never blocks."""
+    pool = _pool()
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=2)
+
+    first = torch.arange(2 * P, dtype=torch.int32)
+    pool.alloc_swa(first)
+    assert tier.put(first, first.clone()) == 2 * P
+    tier.flush()
+    assert tier.host_pages_count == 2
+    first_tokens = tier.page_metadata[0]["token_ids"]
+    pool.free_swa(first)  # the tier holds its own copies; recycle the GPU slots
+
+    # A different prefix: capacity is full, no disk dir -- the oldest pages must
+    # be dropped (not spilled) and the new put must succeed.
+    second = torch.arange(100, 100 + 2 * P, dtype=torch.int32)
+    pool.alloc_swa(second)
+    assert tier.put(second, second.clone()) == 2 * P
+    tier.flush()
+    assert tier.host_pages_count == 2
+    assert tier.disk_pages_count == 0
+    assert tier.stats.evicted_pages >= 1  # the radix evicts whole leaves
+    assert tier.page_metadata[next(iter(tier.host_pages))]["token_ids"] != first_tokens
+
+    # The dropped prefix no longer matches.
+    assert tier.match_len(first) == 0
+    assert tier.match_len(second) == 2 * P
