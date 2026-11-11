@@ -227,6 +227,7 @@ def tokenize_worker(
                         gpu_mem_bytes=msg.gpu_mem_bytes,
                         hicache=msg.hicache,
                         kv_cache=msg.kv_cache,
+                        decode_stage=msg.decode_stage,
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]

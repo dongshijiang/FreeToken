@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -104,6 +105,7 @@ class Scheduler(SchedulerIOMixin):
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
             host_prefix_cache=self._create_host_prefix_cache(config),
+            host_write_policy=config.host_prefix_cache_write_policy,
         )
         self.decode_manager = DecodeManager(config.page_size)
         self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
@@ -158,6 +160,20 @@ class Scheduler(SchedulerIOMixin):
         self.config = config
         self._model_is_mrope = config.model_config.model_is_mrope
         self._warned_cut_image = False
+        # Decode-step stage timing (TPOT attribution): cumulative ms per stage over
+        # decode-only loop iterations, snapshotted onto status replies and /v1/stats.
+        # Buckets: msg (message polling), sched (batch scheduling + state restore),
+        # launch (forward launch, CPU side), gpu (stream wait + result processing).
+        # sched is sub-split into wait (cross-stream queueing behind the engine
+        # stream), pick (batch selection + page allocation inside the managers)
+        # and prep (slot maps, sampling params, staged H2D copies); wait+pick+prep
+        # add up to sched. Totals (not means) so /v1/stats snapshot diffs yield
+        # per-window means.
+        self._stage_ms: dict[str, float] = {
+            "msg": 0.0, "sched": 0.0, "launch": 0.0, "gpu": 0.0, "iter": 0.0,
+            "sched_wait": 0.0, "sched_pick": 0.0, "sched_prep": 0.0,
+        }
+        self._stage_iters = 0
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
@@ -268,6 +284,7 @@ class Scheduler(SchedulerIOMixin):
         It will overlap the execution of current batch and processing of last batch's results,
         which can effectively hide CPU latency and improve GPU utilization.
         """
+        _t0 = time.perf_counter()
         # Expose the un-drained batch to _process_one_msg (abort in-flight check). Assigning
         # before the message loop is what makes the check airtight: the batch launched later
         # this iteration can only be probed by messages of the NEXT iteration, which sees it here.
@@ -280,6 +297,7 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+        _t1 = time.perf_counter()
 
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
@@ -295,8 +313,15 @@ class Scheduler(SchedulerIOMixin):
         # table_idx can have its freshly copied prompt clobbered by the prior occupant's
         # still-pending output write -- corrupting tokens (e.g. dropping an image
         # placeholder, which the multimodal merge then rejects).
+        _w0 = time.perf_counter()
         self.stream.wait_stream(self.engine.stream)
+        _w1 = time.perf_counter()
         forward_input = self._schedule_next_batch()
+        if forward_input is not None and forward_input.batch.is_decode:
+            # CPU queueing behind the engine stream before scheduling can start;
+            # part of the sched bucket (see _stage_time's docstring).
+            self._stage_ms["sched_wait"] += (_w1 - _w0) * 1e3
+        _t2 = time.perf_counter()
         ongoing_data = None
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
@@ -306,6 +331,7 @@ class Scheduler(SchedulerIOMixin):
                 # vs the prior batch's snapshot writes). Doing this on self.stream would race.
                 self._restore_linear_states(forward_input.batch)
                 ongoing_data = (forward_input, self._forward(forward_input))
+        _t3 = time.perf_counter()
 
         # The drain issues GPU-visible writes to state the batch just launched still reads: the
         # page-table re-point and, for the paged-SWA pools, the full->swa (DSV4: full->window)
@@ -315,9 +341,11 @@ class Scheduler(SchedulerIOMixin):
         self.stream.wait_stream(self.engine.stream)
         self._process_last_data(last_data)
         self._flush_abort_acks()
+        self._stage_time(_t0, _t1, _t2, _t3, time.perf_counter(), forward_input)
         return ongoing_data
 
     def normal_loop(self) -> None:
+        _t0 = time.perf_counter()
         blocking = not (
             self.prefill_manager.runnable
             or self.decode_manager.runnable
@@ -325,6 +353,7 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+        _t1 = time.perf_counter()
 
         # Non-overlap mode has no last_data to drain; execute a queued rebuild as soon as
         # the scheduler is idle (no pending prefill / running decode). Without this, a
@@ -335,14 +364,41 @@ class Scheduler(SchedulerIOMixin):
             self._execute_pending_rebuild()
 
         forward_input = self._schedule_next_batch()
+        _t2 = time.perf_counter()
         ongoing_data = None
         if forward_input is not None:
             # already inside engine_stream_ctx (run_forever); restore on the engine stream
             self._restore_linear_states(forward_input.batch)
             ongoing_data = (forward_input, self._forward(forward_input))
+        _t3 = time.perf_counter()
 
         self._process_last_data(ongoing_data)
         self._flush_abort_acks()
+        self._stage_time(_t0, _t1, _t2, _t3, time.perf_counter(), forward_input)
+
+    def _stage_time(
+        self, t0: float, t1: float, t2: float, t3: float, t4: float, forward_input
+    ) -> None:
+        """Accumulate one loop iteration's stage split (decode-only batches only).
+
+        In overlap mode the CPU blocks on the in-flight batch at the ``wait_stream``
+        right before ``_process_last_data`` (the ``gpu`` bucket), so for a steady
+        decode stream the per-iteration split IS the TPOT decomposition.
+        """
+        if forward_input is None or not forward_input.batch.is_decode:
+            return
+        acc = self._stage_ms
+        acc["msg"] += (t1 - t0) * 1e3
+        acc["sched"] += (t2 - t1) * 1e3
+        acc["launch"] += (t3 - t2) * 1e3
+        acc["gpu"] += (t4 - t3) * 1e3
+        acc["iter"] += (t4 - t0) * 1e3
+        self._stage_iters += 1
+
+    def _stage_snapshot(self) -> dict[str, float]:
+        out = {f"{k}_ms_total": round(v, 3) for k, v in self._stage_ms.items()}
+        out["iters"] = self._stage_iters
+        return out
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
@@ -487,6 +543,10 @@ class Scheduler(SchedulerIOMixin):
                         m.hicache = self.cache_manager.host_prefix_cache.stats_snapshot()
                     except Exception as exc:
                         logger.warning("could not snapshot host prefix cache: %r", exc)
+                # Test fakes stub the scheduler as a bare SimpleNamespace; the TPOT stage
+                # breakdown only exists on the real engine loop.
+                if hasattr(self, "_stage_snapshot"):
+                    m.decode_stage = self._stage_snapshot()
         engine = getattr(self, "engine", None)
         moe_cache = getattr(engine, "moe_offload_cache", None)
         self.status_reporter.report_batch(
@@ -991,16 +1051,24 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
+        _t0 = time.perf_counter()
         batch = (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
         )
         if batch is not None and batch.is_decode:
             batch = self._gate_decode_batch(batch)
+        _t1 = time.perf_counter()
         if batch is None:
             return None
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
+        if batch.is_decode:
+            # Sub-split of the sched bucket (decode iterations only, matching
+            # _stage_time's gating): pick covers the managers' batch selection
+            # and page allocation, prep the forward-input assembly.
+            self._stage_ms["sched_pick"] += (_t1 - _t0) * 1e3
+            self._stage_ms["sched_prep"] += (time.perf_counter() - _t1) * 1e3
         return forward_input
 
     def _gate_decode_batch(self, batch: Batch) -> Batch | None:

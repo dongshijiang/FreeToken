@@ -52,6 +52,9 @@ class DetokenizeMsg(BaseTokenizerMsg):
     hicache: Dict[str, int] | None = None
     # Global KV hit-rate counters (GPU radix + host restore); None when not reported.
     kv_cache: Dict[str, int] | None = None
+    # Decode-step stage timing (cumulative totals in ms + iteration count over decode-only
+    # steps); None when not reported. Diffed across /v1/stats snapshots to attribute TPOT.
+    decode_stage: Dict[str, float] | None = None
 
 
 @dataclass

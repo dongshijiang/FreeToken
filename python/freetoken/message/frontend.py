@@ -49,6 +49,8 @@ class UserReply(BaseFrontendMsg):
     hicache: Dict[str, int] | None = None
     # Global KV hit-rate counters (GPU radix + host restore), one snapshot per status reply.
     kv_cache: Dict[str, int] | None = None
+    # Decode-step stage timing totals (ms) over decode-only steps; None when not reported.
+    decode_stage: Dict[str, float] | None = None
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would
