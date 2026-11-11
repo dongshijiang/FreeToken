@@ -1027,3 +1027,217 @@ def test_full_host_tier_without_disk_dir_evicts_drop_style():
     # The dropped prefix no longer matches.
     assert tier.match_len(first) == 0
     assert tier.match_len(second) == 2 * P
+
+
+def _wb_pool(num_pages: int):
+    """A DSV4 pool sized for ``num_pages`` full pages (the _pool shape, scaled)."""
+    from freetoken.kvcache.dsv4_cost_model import dsv4_pool_sizes
+
+    sizes = dsv4_pool_sizes(num_pages=num_pages, args=_args(), swa_ratio=1.0, P=P)
+    pool = DSV4PagedKVCache(
+        sizes=sizes, args=_args(), device=torch.device("cpu"), dtype=torch.bfloat16,
+        P=P, n_scratch=1,
+    )
+    pool._init_paged_state(max_running_req=1, radix=True)
+    return pool
+
+
+def test_write_back_defers_host_put_until_gpu_radix_eviction(tmp_path):
+    """write_back policy: a committed prefix NEVER touches the host tier at prefill
+    time; the copy happens on the eviction path (CacheManager._allocate -> evict_full),
+    after which a re-match restores from the host tier (sglang HiCache write_back)."""
+    from types import SimpleNamespace
+
+    from freetoken.core import Req, SamplingParams
+    from freetoken.scheduler.cache import CacheManager
+
+    pool = _wb_pool(8)
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=2)
+    pt = torch.zeros(4, 8 * P, dtype=torch.int32)
+    cm = CacheManager(
+        num_pages=8, page_size=P, page_table=pt, type="swa_radix",
+        swa_pool=pool, sliding_window_size=P, host_prefix_cache=tier,
+        host_write_policy="write_back",
+    )
+    assert cm._host_write_back
+
+    ids = list(range(1000, 1000 + 2 * P + 1))
+    pending = SimpleNamespace(input_ids=torch.tensor(ids, dtype=torch.int32), input_len=len(ids))
+    handle = cm.match_req(pending).cuda_handle
+    req = Req(
+        input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=0, cached_len=0,
+        output_len=0, uid=0, sampling_params=SamplingParams(), cache_handle=handle,
+    )
+    req.device_len = len(ids)
+    cm.lock(handle)
+    cm.allocate_paged([req])
+    req.cached_len = len(ids)
+
+    window_slots = pool.translate_full_to_window(pt[0, :2 * P])
+    for layer in range(3):
+        pool.window_pool[layer][window_slots.long()] = torch.arange(
+            2 * P, dtype=torch.bfloat16).unsqueeze(1) + 100 * layer
+    pool.cmp_pool[1][:32] = torch.arange(32, dtype=torch.bfloat16).view(32, 1).expand(32, 8) + 7
+    pool.cmp_pool[2][:2] = torch.tensor([[31] * 8, [63] * 8], dtype=torch.bfloat16)
+    pool.idx_pool[1][:32] = torch.arange(32, dtype=torch.bfloat16).view(32, 1).expand(32, 4) + 9
+    expected_window = pool.window_pool[0][window_slots.long()].cpu().clone()
+    with cm.lazy_free_region():
+        cm.cache_req(req, finished=False)
+
+    # The core write_back promise: the commit wrote NOTHING to the host tier.
+    assert cm._host_writeback_pages == 0
+    assert tier.host_pages_count == 0
+
+    # Free the tree pin, then apply allocation pressure (one page more than free) so
+    # _allocate must evict the tree's 2-page leaf; the write-back hook must copy it
+    # to the host tier BEFORE the swa/full slots go back to the free lists.
+    cm.unlock(req.cache_handle)
+    forced = cm._allocate(6)   # 1 page over free -> must evict the 2-page leaf
+    assert tier.host_pages_count == 2
+    assert cm._host_writeback_pages == 2
+    tier.flush()
+    assert tier.match_len(torch.tensor(ids[:2 * P], dtype=torch.int32)) == 2 * P
+
+    # The forced allocation was a phantom consumer: hand its pages (plus the
+    # abandoned request's tail page) back so the restore capacity gate
+    # (available_size >= restore depth + prompt tail) clears -- the same idle-but-
+    # full-pool state the write-through test's seeding cycle leaves behind.
+    cm.free_slots = torch.cat([cm.free_slots, forced, pt[0, 2 * P:3 * P][::P].clone()])
+
+    # Poison every live pool buffer: a successful re-match can only come from the
+    # host tier's write-back copies.
+    for layer in range(3):
+        pool.window_pool[layer].fill_(float("nan"))
+    pool.cmp_pool[1].fill_(float("nan")); pool.cmp_pool[2].fill_(float("nan"))
+    pool.idx_pool[1].fill_(float("nan"))
+
+    restored = cm.match_req(pending).cuda_handle
+    assert restored.cached_len == 2 * P
+    restored_locs = restored.get_matched_indices()
+    restored_windows = pool.translate_full_to_window(restored_locs)
+    assert torch.equal(
+        pool.window_pool[0][restored_windows[-P:].long()].cpu(), expected_window[-P:]
+    )
+    # The restored pages may land anywhere in the pool: check the seeded layer-1/2
+    # state at wherever the first/second restored page actually landed.
+    q0 = int(restored_locs[0].item()) // P
+    q1 = int(restored_locs[P].item()) // P
+    assert torch.equal(
+        pool.cmp_pool[1][q0 * 32:(q0 + 1) * 32].cpu(),
+        torch.arange(32, dtype=torch.bfloat16).view(32, 1).expand(32, 8) + 7,
+    )
+    assert torch.equal(
+        pool.cmp_pool[2][[q0, q1]].cpu(),
+        torch.tensor([[31] * 8, [63] * 8], dtype=torch.bfloat16),
+    )
+
+
+def test_write_back_reports_cascaded_tombstone_leaves():
+    """evict_full(leaves_out=...) reports (key, value) for LIVE leaves AND for the
+    swa-tombstone leaves the unlink cascade exposes -- write-back backs up their
+    full KV too (window pages are sentinel-safe: they snapshot as window=None)."""
+    from freetoken.kvcache.swa_radix_cache import SWARadixCache
+
+    tree = SWARadixCache(torch.device("cpu"), page_size=P, sliding_window_size=P)
+    n = 3 * P
+    ids = torch.arange(n, dtype=torch.int32)
+    locs = torch.arange(n, dtype=torch.int32)
+    # root - A(ids[:2P], internal) - B(ids[2P:], live leaf): two tree nodes.
+    tree.insert(ids[:2 * P], locs[:2 * P])
+    tree.insert(ids, locs)
+
+    # Tombstone the internal head the way trim/free-swa does: swa freed, full KV kept.
+    freed_swa = tree.trim_head_swa(ids, 2 * P)
+    assert len(freed_swa) == 2 * P
+    assert tree._all_nodes()[0].swa_tombstone  # A is now a swa-tombstone internal node
+
+    leaves_out: list = []
+    res = tree.evict_full(n, leaves_out=leaves_out)
+    assert len(res.kv_indices) == n
+    # Popping B must cascade through the exposed tombstone leaf A -> 2 reported leaves
+    # (report order is pop order: B first, then A).
+    assert len(leaves_out) == 2
+    (k_b, v_b), (k_a, v_a) = leaves_out
+    assert torch.equal(k_b, ids[2 * P:]) and torch.equal(v_b, locs[2 * P:])
+    assert torch.equal(k_a, ids[:2 * P]) and torch.equal(v_a, locs[:2 * P])
+
+
+def test_write_back_windowless_restore_recomputes_tail(tmp_path):
+    """The production write_back shape: by eviction time the prefix's window KV has
+    slid out of the window pool, so the snapshot is window-less and restorable_len
+    reports 0. The restore must still land [0, n-P) as an all-tombstone chain with
+    cached_len = n-P (only the tail page is recomputed)."""
+    from types import SimpleNamespace
+
+    from freetoken.core import Req, SamplingParams
+    from freetoken.scheduler.cache import CacheManager
+
+    pool = _wb_pool(8)
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=2)
+    pt = torch.zeros(4, 8 * P, dtype=torch.int32)
+    cm = CacheManager(
+        num_pages=8, page_size=P, page_table=pt, type="swa_radix",
+        swa_pool=pool, sliding_window_size=P, host_prefix_cache=tier,
+        host_write_policy="write_back",
+    )
+
+    ids = list(range(1000, 1000 + 2 * P + 1))
+    pending = SimpleNamespace(input_ids=torch.tensor(ids, dtype=torch.int32), input_len=len(ids))
+    handle = cm.match_req(pending).cuda_handle
+    req = Req(
+        input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=0, cached_len=0,
+        output_len=0, uid=0, sampling_params=SamplingParams(), cache_handle=handle,
+    )
+    req.device_len = len(ids)
+    cm.lock(handle)
+    cm.allocate_paged([req])
+    req.cached_len = len(ids)
+    orig_locs = pt[0, :2 * P].clone()
+
+    window_slots = pool.translate_full_to_window(pt[0, :2 * P])
+    for layer in range(3):
+        pool.window_pool[layer][window_slots.long()] = torch.arange(
+            2 * P, dtype=torch.bfloat16).unsqueeze(1) + 100 * layer
+    pool.cmp_pool[1][:32] = torch.arange(32, dtype=torch.bfloat16).view(32, 1).expand(32, 8) + 7
+    with cm.lazy_free_region():
+        cm.cache_req(req, finished=False)
+    cm.unlock(req.cache_handle)
+
+    # The window slid out of the pool before eviction: tombstone the tree leaf and
+    # release its swa slots (the evict_swa-on-internal + child-unlink end state).
+    node, matched = cm.prefix_cache.match_prefix_full(torch.tensor(ids[:2 * P], dtype=torch.int32))
+    assert matched == 2 * P and not node.swa_tombstone
+    pool.free_swa(orig_locs)
+    node.swa_tombstone = True
+    cm.prefix_cache.swa_evictable -= node.length
+
+    # Evict -> the write-back put must snapshot window-less pages.
+    forced = cm._allocate(6)
+    assert tier.host_pages_count == 2
+    tier.flush()
+    assert tier.match_len(torch.tensor(ids[:2 * P], dtype=torch.int32)) == 2 * P
+    assert tier.restorable_len(torch.tensor(ids[:2 * P], dtype=torch.int32)) == 0
+
+    cm.free_slots = torch.cat([cm.free_slots, forced])
+    for layer in range(3):
+        pool.window_pool[layer].fill_(float("nan"))
+    pool.cmp_pool[1].fill_(float("nan"))
+
+    restored = cm.match_req(pending).cuda_handle
+    # Only the tail page is recomputed: cached_len = 2P - P.
+    assert restored.cached_len == P
+    locs = restored.get_matched_indices()
+    assert len(locs) == P
+    # No swa slot was bound (all-tombstone restore) and the compressed state landed.
+    assert bool((pool.translate_full_to_window(locs) < 0).all())
+    q0 = int(locs[0].item()) // P
+    assert torch.equal(
+        pool.cmp_pool[1][q0 * 32:(q0 + 1) * 32].cpu(),
+        torch.arange(32, dtype=torch.bfloat16).view(32, 1).expand(32, 8) + 7,
+    )
+    # The published chain is all-tombstone with the canonical locs.
+    n2, m2 = cm.prefix_cache.match_prefix_full(torch.tensor(ids[:P], dtype=torch.int32))
+    assert m2 == P and n2.swa_tombstone
+    assert cm.prefix_cache.check_integrity() is None
+
+

@@ -35,7 +35,7 @@ logger = init_logger(__name__)
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None,
-                 host_prefix_cache=None):
+                 host_prefix_cache=None, host_write_policy: str = "write_through"):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -57,6 +57,22 @@ class CacheManager:
             type == "radix"
             or (type == "swa_radix" and getattr(host_prefix_cache, "supports_dsv4", False))
         ) else None
+        # Host-tier write policy (sglang HiCache semantics). write_back defers the host
+        # copy to GPU-radix eviction time; only the DSV4/SWA path implements it -- every
+        # other family silently keeps write_through (the tier has no eviction hook there).
+        self.host_write_policy = host_write_policy
+        self._host_write_back = (
+            host_write_policy == "write_back"
+            and self.is_swa
+            and self.host_prefix_cache is not None
+        )
+        if host_write_policy == "write_back" and not self._host_write_back:
+            logger.warning(
+                "host-prefix-cache write policy 'write_back' requested but unsupported "
+                "for this model family (is_swa=%s, host tier=%s); using write_through.",
+                self.is_swa, self.host_prefix_cache is not None,
+            )
+        self._host_writeback_pages = 0
         # swa_paged: this SWA model drives the global-paged swa pool -- true for BOTH the naive
         # (NaivePrefixCache, no reuse) and radix (SWARadixCache) paths. Gates the swa slot
         # lifecycle (alloc_swa / out-of-window free / free-on-finish). is_swa gates only the extra
@@ -259,9 +275,16 @@ class CacheManager:
     def ensure_swa_slots(self, n: int) -> None:
         """Free swa-pool slots until >= ``n`` are available by tombstoning LRU tree swa nodes
         (evict_swa, internal -> tombstone in place / leaf -> free both pools), returning their swa
-        slots to the pool and any deleted-leaf full KV to free_slots."""
+        slots to the pool and any deleted-leaf full KV to free_slots. write_back: a freed leaf's
+        full KV dies here -- offer it to the host tier first, or window pressure would erase
+        prefixes that never survive to a full-pass eviction."""
         while self.swa_pool.swa_available_size() < n:
-            ev = self.prefix_cache.evict_swa(n - self.swa_pool.swa_available_size())
+            wb_leaves: List[Tuple[torch.Tensor, torch.Tensor]] = []
+            ev = self.prefix_cache.evict_swa(
+                n - self.swa_pool.swa_available_size(),
+                leaves_out=wb_leaves if self._host_write_back else None)
+            if wb_leaves:
+                self._writeback_evicted_leaves(wb_leaves)
             if ev.swa_indices.numel() == 0:
                 break
             self.swa_pool.free_swa(ev.swa_indices)
@@ -456,8 +479,20 @@ class CacheManager:
         P = host.page_size
         try:
             target = min(host.restorable_len(ids), align_down(len(ids), P))
+            # write_back shape: by GPU-eviction time the prefix's window KV has usually
+            # already slid out of the window pool, so every stored page is window-less
+            # and restorable_len (which demands a window-carrying tail page) reports 0.
+            # The full-layer KV is still reusable: restore [0, target-P) as an
+            # ALL-TOMBSTONE chain and recompute only the last page -- SWA layers never
+            # read further back than the trailing window, and the request's own commits
+            # own everything from there (the write-through path never lands here: its
+            # commit-time puts always carry a live trailing window).
+            windowless = False
             if target <= int(handle.cached_len):
-                return handle
+                wl = align_down(host.match_len(ids), P) - P
+                if wl <= int(handle.cached_len):
+                    return handle
+                target, windowless = wl, True
             # Chunked prefill re-matches on every step; count each request once so the
             # eligible denominator stays per-request (retries within one request must
             # not inflate it under swa-slot pressure).
@@ -510,6 +545,36 @@ class CacheManager:
                 # Insert every restored page live, publish the full prefix, then tombstone
                 # the head down to one trailing window. Doing it in this order avoids the
                 # SWA match rule truncating a two-page restore to just its live tail.
+                # The window-less shape instead publishes an all-tombstone chain: the
+                # windowed match rule would truncate a tombstone prefix to 0, so the
+                # handle is built directly at the full restore boundary.
+                if windowless:
+                    _, freed = self.prefix_cache.insert(
+                        req.input_ids[:target], full_locs, swa_evicted_seqlen=target,
+                    )
+                    published = True
+                    self._free_swa(freed)
+                    self._free(freed)
+                    wl_node, wl_matched = self.prefix_cache.match_prefix_full(
+                        req.input_ids[:target])
+                    # insert's suffix clamp always leaves a live tail leaf whose swa
+                    # mapping is the sentinel -- tombstone it in place (a legal
+                    # cascade shape: full KV kept, unlocked, no children).
+                    if not wl_node.swa_tombstone:
+                        wl_node.swa_tombstone = True
+                        self.prefix_cache.swa_evictable -= wl_node.length
+                    self.prefix_cache._stamp_path(wl_node)
+                    new_handle = SWACacheHandle(
+                        wl_matched, wl_node, self._chain_locs(wl_node))
+                    self.lock(new_handle)
+                    object.__setattr__(new_handle, "restore_locked", True)
+                    if getattr(req, "_host_restore_success", False):
+                        host.stats.restore_repeats += 1
+                    else:
+                        host.stats.restore_requests += 1
+                        host.stats.restore_tokens += restored
+                        req._host_restore_success = True
+                    return new_handle
                 _, freed = self.prefix_cache.insert(
                     req.input_ids[:target], full_locs, update_kv_after_len=0,
                 )
@@ -554,6 +619,21 @@ class CacheManager:
                 logger.warning("DSV4 host prefix restore failed; falling back: %r", exc)
                 host._warned_restore_failure = True
             return handle
+
+    @staticmethod
+    def _chain_locs(node) -> torch.Tensor:
+        """Full-pool locs for [0, node_end): the root->node concatenation of the SWA radix
+        chain's canonical values. The window-less restore builds its handle directly (the
+        windowed match would truncate an all-tombstone prefix to 0), so the locs are
+        collected from the tree instead of a match result."""
+        vals = []
+        cur = node
+        while not cur.is_root():
+            vals.append(cur.value)
+            cur = cur.parent
+        if not vals:
+            return torch.empty(0, dtype=torch.int32)
+        return torch.cat(list(reversed(vals)))
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
@@ -787,6 +867,11 @@ class CacheManager:
         host = self.host_prefix_cache
         if host is None or not getattr(host, "supports_dsv4", False) or insert_len <= 0:
             return
+        if self._host_write_back:
+            # sglang write_back semantics: the host copy happens on GPU-radix eviction
+            # (_writeback_evicted_leaves), not at prefill commit. Short-lived prefixes
+            # that die before eviction never touch the host tier.
+            return
         if os.environ.get("FREETOKEN_SKIP_DSV4_HOST_PUT"):
             # Diagnostic switch: serve with the host tier matching enabled but all
             # write-through disabled, to attribute TTFT overhead between the put
@@ -849,6 +934,31 @@ class CacheManager:
             release()  # never leak the pin, even when the enqueue itself fails
             raise
         return True
+
+    def _writeback_evicted_leaves(
+        self, leaves: List[Tuple[torch.Tensor, torch.Tensor]]
+    ) -> None:
+        """write-back flush: copy each GPU-radix-evicted leaf's full KV to the host tier.
+
+        Runs on the eviction path (inside _allocate), synchronously and BEFORE the caller
+        frees the swa/full slots -- the put gathers from the pools, so the KV must still be
+        live. The loop-start wait_stream(engine.stream) covers prior kernel writes the same
+        way it does for the write-through put. Per sglang's host-pressure behavior
+        (_drop_subtree_no_host): a failed leaf is warned and dropped, never fatal -- the
+        prefix simply misses on the next match."""
+        host = self.host_prefix_cache
+        if host is None:
+            return
+        written = 0
+        for key, value in leaves:
+            try:
+                host.put(key, value)
+                written += len(key)
+            except Exception as exc:
+                logger.warning(
+                    "write_back: host put of a %d-page evicted prefix failed, dropping "
+                    "(next match re-prefills): %r", len(key) // self.page_size, exc)
+        self._host_writeback_pages += written // self.page_size
 
     def _padded_tail(self, req: Req, start: int) -> torch.Tensor:
         """The request's OWN slice [start, page_ceil(cached_len)) of the page table. A finish
@@ -951,8 +1061,15 @@ class CacheManager:
             need = (needed_pages - free_pages) * self.page_size
             if self.is_swa:
                 # Evicting KV leaf nodes drops their swa slots too -> return both pools.
-                ev = self.prefix_cache.evict_full(need)
+                # write_back: each evicted leaf's pool KV is copied to the host tier first
+                # (sglang _execute_and_commit_kv_backup), THEN freed -- the put reads the
+                # pools, so it must precede both _free_swa and the free_slots concat below.
+                wb_leaves: List[Tuple[torch.Tensor, torch.Tensor]] = []
+                ev = self.prefix_cache.evict_full(
+                    need, leaves_out=wb_leaves if self._host_write_back else None)
                 evicted = ev.kv_indices
+                if wb_leaves:
+                    self._writeback_evicted_leaves(wb_leaves)
                 self._free_swa(ev.swa_indices)
             elif self.is_hybrid:
                 # Evicting KV leaf nodes drops their GDN snapshots too -> return both pools.

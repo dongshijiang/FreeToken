@@ -310,10 +310,17 @@ class SWARadixCache:
             cur = cur.parent
 
     # ---------------------------------------------------------------- eviction (dual)
-    def evict_full(self, num_tokens: int) -> SWAEvictResult:
+    def evict_full(self, num_tokens: int,
+                   leaves_out: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+                   ) -> SWAEvictResult:
         """Evict full KV by LRU over UNLOCKED LEAF nodes (an internal node's KV is a prefix
         dependency). Frees both pools for each evicted leaf; cascade-reclaims exposed swa-tombstone
-        leaves' full KV. Mirrors sglang ``evict`` full pass."""
+        leaves' full KV. Mirrors sglang ``evict`` full pass.
+
+        ``leaves_out`` (write-back): when given, every evicted leaf -- live and cascade-exposed
+        tombstone alike -- appends ``(key, value)`` there BEFORE unlink, so the caller can copy
+        the still-intact pool KV to the host tier and only then free the slots (sglang
+        ``_execute_and_commit_kv_backup``). The put must happen before the caller frees swa/kv."""
         leaves = [n for n in self._leaves() if n.ref_count == 0]
         heapq.heapify(leaves)
         kv, swa, freed = [], [], 0
@@ -323,11 +330,14 @@ class SWARadixCache:
                 continue
             freed += node.length
             kv.append(node.value)
+            if leaves_out is not None:
+                leaves_out.append((node._key, node.value))
             self.full_evictable -= node.length
             if not node.swa_tombstone:
                 swa.append(node.value)          # its swa is still live -> free it too
                 self.swa_evictable -= node.length
-            parent, casc = self._cascade_swa_tombstone_leaves(self._unlink(node), kv)
+            parent, casc = self._cascade_swa_tombstone_leaves(self._unlink(node), kv,
+                                                              leaves_out=leaves_out)
             freed += casc
             # Re-push the SURVIVING ancestor the cascade returned (the original parent may have
             # been unlinked/freed by the cascade -- re-pushing it would double-free / KeyError).
@@ -336,11 +346,17 @@ class SWARadixCache:
         return SWAEvictResult(torch.cat(kv) if kv else self.empty,
                               torch.cat(swa) if swa else self.empty)
 
-    def evict_swa(self, num_tokens: int) -> SWAEvictResult:
+    def evict_swa(self, num_tokens: int,
+                  leaves_out: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+                  ) -> SWAEvictResult:
         """Evict swa KV by LRU over UNLOCKED, non-tombstone swa-bearing nodes -- internal nodes
         too. Internal (or full-locked) node -> TOMBSTONE in place (free swa, keep full KV +
         children). Free leaf -> free both pools, unlink, cascade. Mirrors sglang ``evict`` swa
-        pass + the leaf-with-full-lock edge."""
+        pass + the leaf-with-full-lock edge.
+
+        ``leaves_out`` (write-back): a freed leaf's full KV is destroyed here, so like
+        ``evict_full`` it must be offered to the host tier first -- window pressure would
+        otherwise silently erase prefixes that never survive to a full-pass eviction."""
         cands = [n for n in self._swa_nodes() if n.swa_ref_count == 0]
         heapq.heapify(cands)
         kv, swa, freed = [], [], 0
@@ -350,12 +366,15 @@ class SWARadixCache:
                 continue
             if node.is_leaf() and node.ref_count == 0:
                 kv.append(node.value)
+                if leaves_out is not None:
+                    leaves_out.append((node._key, node.value))
                 swa.append(node.value)
                 self.full_evictable -= node.length
                 self.swa_evictable -= node.length
                 freed += node.length
                 node.swa_tombstone = True
-                self._cascade_swa_tombstone_leaves(self._unlink(node), kv)
+                self._cascade_swa_tombstone_leaves(self._unlink(node), kv,
+                                                   leaves_out=leaves_out)
             else:
                 swa.append(node.value)          # tombstone internal / full-locked leaf in place
                 self.swa_evictable -= node.length
@@ -414,17 +433,21 @@ class SWARadixCache:
         return parent
 
     def _cascade_swa_tombstone_leaves(
-        self, parent: RadixTreeNode, kv_out: List[torch.Tensor]
+        self, parent: RadixTreeNode, kv_out: List[torch.Tensor],
+        leaves_out: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> Tuple[RadixTreeNode, int]:
         """After a leaf is unlinked, eagerly reclaim the swa-tombstone leaves it exposes upward
         (full KV still present, no children, unlocked): free their full KV and unlink. Keeps the
         'a live leaf always carries live swa' invariant (sglang _iteratively_delete_tombstone_leaf).
         Returns ``(surviving_ancestor, freed_full_tokens)`` -- the caller MUST use the returned
-        ancestor (the passed-in ``parent`` may itself have been unlinked/freed by the cascade)."""
+        ancestor (the passed-in ``parent`` may itself have been unlinked/freed by the cascade).
+        ``leaves_out`` (write-back): each cascaded tombstone leaf also reports its (key, value)."""
         freed = 0
         while (parent.swa_tombstone and parent.is_leaf()
                and parent.ref_count == 0 and not parent.is_root()):
             kv_out.append(parent.value)
+            if leaves_out is not None:
+                leaves_out.append((parent._key, parent.value))
             self.full_evictable -= parent.length
             freed += parent.length
             parent = self._unlink(parent)

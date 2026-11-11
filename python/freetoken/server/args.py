@@ -848,6 +848,21 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--host-prefix-cache-write-policy",
+        choices=["write_through", "write_back"],
+        dest="host_prefix_cache_write_policy",
+        default=ServerArgs.host_prefix_cache_write_policy,
+        help=(
+            "Host-tier write policy. write_through: every committed prefix page is "
+            "copied to the host tier right after prefill. write_back (sglang HiCache "
+            "semantics): pages are copied only when evicted from the GPU radix, so "
+            "short-lived prefixes never touch the host tier; the copy runs on the "
+            "eviction path. DSV4/SWA models only; other model families keep "
+            "write_through behavior."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",

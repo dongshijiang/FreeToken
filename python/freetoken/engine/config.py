@@ -95,8 +95,13 @@ class EngineConfig:
     host_prefix_cache_dir: str | None = None
     host_prefix_cache_disk_gib: float = 0.0
     # Restore SSD-resident prefix pages straight into GPU memory via GPUDirect
-    # Storage; falls back to the host path when nvidia_fs is unavailable.
+    # Storage; falls back to the nvidia_fs unavailable path.
     host_prefix_cache_gds: bool = False
+    # Host-tier write policy: "write_through" copies each committed prefix page to the
+    # host tier right after prefill (async pipeline); "write_back" defers the copy to
+    # GPU-radix eviction time (sglang HiCache write_back semantics) -- short-lived
+    # prefixes never touch the host tier, at the cost of gathering on the eviction path.
+    host_prefix_cache_write_policy: str = "write_through"
     # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
