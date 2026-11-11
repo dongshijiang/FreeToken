@@ -42,6 +42,12 @@ _trace_fh = None
 # production.
 _KV_OUTPUT_RESERVE = int(os.environ.get("FREETOKEN_KV_OUTPUT_RESERVE", "0") or 0)
 
+# FREETOKEN_RESTORE_BYPASS=0 skips the restore-readiness probe entirely: admission
+# goes straight to match_req, which blocks on in-flight host warms the same way.
+# Default on: the probe re-kicks missing warms and exports probe counters before
+# the (usually no-op) wait. (Tests patch the module global directly.)
+_RESTORE_BYPASS = os.environ.get("FREETOKEN_RESTORE_BYPASS", "1") != "0"
+
 
 def _trace_schedule(mgr, adder, reqs, failed_uid) -> None:
     global _trace_fh
@@ -116,7 +122,21 @@ class PrefillAdder:
             self.last_fail = "table_exhausted"
             return None
 
-        # TODO: consider host cache match case
+        # Restore gate: a request whose DSV4 host pages are still warming would
+        # block the admission loop inside match_req. Probe first (metadata only)
+        # to re-kick missing warms, then wait out-of-line so the stall is visible
+        # and counted before match_req repeats the (now no-op) wait.
+        # SPMD lockstep: the probe verdict is rank-local (each rank's tier warms
+        # on its own disk timeline), so deferring the request here would build
+        # different batches per rank -- the admitting peer would launch NCCL
+        # collectives this rank never matches while this rank's next receive
+        # needs the peer's gloo broadcast: ABBA deadlock (repro'd on 2xL20:
+        # forward stuck in MoE copy-stream sync, AllReduce spinning on GPU0).
+        # Blocking instead keeps every rank's batch the same FIFO prefix; warm
+        # latency may differ per rank but readiness is monotone, so collectives
+        # pair up once the slower rank catches up. CPU-only wait, no CUDA submit.
+        if _RESTORE_BYPASS and not self.cache_manager.restore_ready(req):
+            self.cache_manager.wait_restore(req)
         mr = self.cache_manager.match_req(req)
         handle = mr.cuda_handle
         cached_len = handle.cached_len
@@ -373,6 +393,10 @@ class PrefillManager:
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
+        # Pendings that stay: on a hard failure, the failed request and everything
+        # behind it, verbatim. Admission up to that point is a strict FIFO prefix,
+        # so this rebuilds the same order the old len(reqs) slicing produced.
+        kept: List[PendingReq] = []
         prompt_admissions: List[Tuple[int, int, int]] = []
         # Snapshot here, before the forward's complete_one() advances cached_len: the tokens
         # forwarded this batch (extend_len) and the prefix-cache hit. SGLang counts the hit
@@ -380,7 +404,7 @@ class PrefillManager:
         log_new_tokens = 0
         log_cached_tokens = 0
         failed_uid = None
-        for pending_req in self.pending_list:
+        for idx, pending_req in enumerate(self.pending_list):
             is_continuation = pending_req.chunked_req is not None
             adder.last_fail = ""
             if req := adder.try_add_one(pending_req):
@@ -407,12 +431,13 @@ class PrefillManager:
                     log_cached_tokens += req.cache_handle.cached_len
             else:
                 failed_uid = (pending_req.uid, adder.last_fail or "unknown")
+                kept.extend(self.pending_list[idx:])  # hard failure: keep this one + tail verbatim
                 break  # We cannot add more requests
         if _SCHED_TRACE:
             _trace_schedule(self, adder, reqs, failed_uid)
         if len(reqs) == 0:
             return None
-        self.pending_list = chunked_list + self.pending_list[len(reqs) :]
+        self.pending_list = chunked_list + kept
         batch = Batch(reqs=reqs, phase="prefill")
         batch.log_new_tokens = log_new_tokens
         batch.log_cached_tokens = log_cached_tokens

@@ -60,6 +60,11 @@ class DSV4PrefixTierStats:
     # those would only burn disk reads (and, on a full host tier, re-spill).
     prefetch_gpu_resident: int = 0
     prefetch_failures: int = 0
+    # Restore-bypass probe (prefetch_ready): calls, not-ready verdicts (a request
+    # deferred because a warm is still in flight), and disk-only pages re-kicked.
+    probe_calls: int = 0
+    probe_pending: int = 0
+    probe_rekicks: int = 0
     put_ms_total: float = 0.0
     restore_ms_total: float = 0.0
     prefetch_ms_total: float = 0.0
@@ -425,6 +430,57 @@ class DSV4PrefixTier:
         # Never hold the tier lock while waiting: _warm_page needs it to insert the page.
         for future in futures:
             future.result()
+
+    def prefetch_ready(self, token_ids: torch.Tensor, start: int = 0) -> bool:
+        """Non-blocking restore-readiness probe: True when a get() over this prefix
+        would not wait on an in-flight prefetch. Metadata only -- never waits, never
+        touches the GPU pool. Pages below ``start`` (GPU-resident) are exempt, mirroring
+        prefetch(). A done future counts as ready even if the warm failed: the
+        synchronous restore path owns the disk fallback and restore_failures accounting."""
+        self.stats.probe_calls += 1
+        ids = self._cpu(token_ids)
+        aligned = align_down(len(ids), self.page_size)
+        if aligned == 0:
+            return True
+        # FT_PREFIX_TIER_PREFETCH=0: prefetch() never schedules anything, so a
+        # disk-only page would never turn ready -- get() pays disk latency
+        # synchronously as before. Load-bearing against starving the request.
+        if os.environ.get("FT_PREFIX_TIER_PREFETCH", "1") == "0":
+            return True
+        rekick = False
+        with self._lock:
+            if self._closed:
+                return True
+            handle = self.index.match_prefix(ids[:aligned]).cuda_handle
+            matched = int(handle.cached_len)
+            if matched == 0:
+                return True
+            self.index.lock_handle(handle)
+            try:
+                rows = handle.get_matched_indices()
+                gpu_through = align_down(int(start), self.page_size)
+                for lo in range(0, matched, self.page_size):
+                    if lo + self.page_size <= gpu_through:
+                        continue
+                    page_id = int(rows[lo].item()) // self.page_size
+                    if page_id in self.host_pages:
+                        continue
+                    future = self._prefetch_writes.get(page_id)
+                    if future is not None and not future.done():
+                        self.stats.probe_pending += 1
+                        return False
+                    rekick = True   # disk-only, no warm scheduled: re-kick below
+            finally:
+                self.index.lock_handle(handle, unlock=True)
+        if rekick:
+            # Outside the lock; prefetch() is idempotent and takes the RLock itself.
+            # If it scheduled a warm, defer: returning True here would let get()
+            # block on the future we just created. A done-but-missing page (failed
+            # warm) schedules nothing and falls through to True -- the synchronous
+            # restore path owns its disk fallback.
+            self.stats.probe_rekicks += 1
+            return self.prefetch(ids, start=start) == 0
+        return True
 
     @property
     def pending_puts(self) -> int:

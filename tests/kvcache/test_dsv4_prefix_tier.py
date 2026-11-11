@@ -1241,3 +1241,199 @@ def test_write_back_windowless_restore_recomputes_tail(tmp_path):
     assert cm.prefix_cache.check_integrity() is None
 
 
+def _cold_payload(page_id):
+    """Minimal loadable restore segment: warm inserts it into host_pages verbatim."""
+    return {"window": None, "cmp": {}, "idx": {}, "rings": {}}
+
+
+def _seed_cold_tier(n_pages=2):
+    """A tier whose whole prefix is cold from the probe's point of view (host tier
+    emptied; warming succeeds via the patched loader, no disk involved)."""
+    pool = _pool()
+    full = torch.arange(n_pages * P, dtype=torch.int32)
+    pool.alloc_swa(full)
+    ids = torch.arange(1000, 1000 + n_pages * P, dtype=torch.int32)
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=n_pages)
+    assert tier.put(ids, full) == n_pages * P
+    tier.flush()
+    tier.host_pages.clear()
+    return tier, ids
+
+
+def test_prefetch_ready_false_while_warming_then_true(tmp_path, monkeypatch):
+    tier, ids = _seed_cold_tier()
+    gate = threading.Event()
+
+    def gated_load(page_id):
+        assert gate.wait(timeout=30)
+        return _cold_payload(page_id)
+
+    monkeypatch.setattr(tier, "_load_page", gated_load)
+
+    # First probe re-kicks the warm and defers; the in-flight warm keeps it deferred.
+    assert tier.prefetch_ready(ids, start=0) is False
+    assert len(tier._prefetch_writes) == 2
+    assert tier.prefetch_ready(ids, start=0) is False
+    assert tier.stats.probe_rekicks == 1 and tier.stats.probe_pending >= 1
+
+    gate.set()
+    tier.wait_prefetch(ids)
+    assert tier.prefetch_ready(ids, start=0) is True
+
+
+def test_prefetch_ready_rekicks_missing_warm(tmp_path, monkeypatch):
+    tier, ids = _seed_cold_tier()
+    monkeypatch.setattr(tier, "_load_page", _cold_payload)
+    assert tier._prefetch_writes == {}
+    assert tier.prefetch_ready(ids[:P], start=0) is False
+    assert len(tier._prefetch_writes) == 1
+    tier.wait_prefetch(ids[:P])
+    assert tier.prefetch_ready(ids[:P], start=0) is True
+
+
+def test_prefetch_ready_ignores_gpu_resident_span(tmp_path, monkeypatch):
+    tier, ids = _seed_cold_tier()
+    monkeypatch.setattr(tier, "_load_page", _cold_payload)
+    # start=P excuses page 0; page 1 still needs warming.
+    assert tier.prefetch_ready(ids, start=P) is False
+    tier.wait_prefetch(ids)
+    # A fully GPU-resident span probes nothing: cold pages below start don't matter.
+    assert tier.prefetch_ready(ids, start=2 * P) is True
+
+
+def test_prefetch_ready_true_when_prefetch_disabled(tmp_path, monkeypatch):
+    tier, ids = _seed_cold_tier()
+    # With warming disabled nothing will ever schedule a warm: gating on it would
+    # starve the request forever, so the probe must stay out of the way.
+    monkeypatch.setenv("FT_PREFIX_TIER_PREFETCH", "0")
+    assert tier.prefetch_ready(ids, start=0) is True
+    assert tier._prefetch_writes == {}
+
+
+def test_prefetch_ready_lets_failed_warm_reach_restore(tmp_path, monkeypatch):
+    tier, ids = _seed_cold_tier()
+
+    def boom(page_id):
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr(tier, "_load_page", boom)
+    tier.prefetch(ids, start=0)
+    for future in list(tier._prefetch_writes.values()):
+        future.result()  # _warm_page swallows the failure; the future is done
+
+    # Done-but-missing counts as ready: the probe must not defer (or re-kick) forever.
+    # The synchronous restore path then pays its own disk read and owns the failure
+    # accounting (get() raising lands in restore_failures, see the corrupt-payload test).
+    assert tier.prefetch_ready(ids, start=0) is True
+    assert len(tier._prefetch_writes) == 2  # no second warm was scheduled
+
+
+class _FakeHostTier:
+    """Minimal DSV4-shaped host tier for admission-loop tests: probe verdicts are
+    keyed by the first token id; the plain radix restore path sees an empty tier."""
+
+    supports_dsv4 = True
+
+    def __init__(self):
+        from freetoken.kvcache.dsv4_prefix_tier import DSV4PrefixTierStats
+
+        self.stats = DSV4PrefixTierStats()
+        self.ready = {}
+        self.waited = []
+
+    def prefetch_ready(self, token_ids, start=0):
+        return self.ready.get(int(token_ids[0]), True)
+
+    def wait_prefetch(self, token_ids):
+        self.waited.append(int(token_ids[0]))
+
+    def match_len(self, token_ids):
+        return 0
+
+    def get(self, token_ids, locs, start=0):
+        return 0
+
+
+def _build_bypass_managers(host_tier, num_pages=64):
+    from freetoken.core import Context, get_global_ctx, set_global_ctx
+    from freetoken.scheduler.cache import CacheManager
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.table import TableManager
+
+    try:
+        get_global_ctx()
+    except AssertionError:
+        set_global_ctx(Context(page_size=1))
+    pt = torch.zeros((5, 64), dtype=torch.int32, device="cpu")
+    cm = CacheManager(num_pages=num_pages, page_size=1, page_table=pt, type="radix",
+                      host_prefix_cache=host_tier)
+    tm = TableManager(max_running_reqs=4, page_table=pt)
+    dm = DecodeManager(page_size=1)
+    pm = PrefillManager(cm, tm, dm)
+    return cm, pm
+
+
+def _pending(uid, base):
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.utils import PendingReq
+
+    return PendingReq(uid=uid, input_ids=torch.arange(base, base + 32, dtype=torch.int32),
+                      sampling_params=SamplingParams(max_tokens=4))
+
+
+def test_restore_gate_waits_then_admits_in_fifo_order():
+    fake = _FakeHostTier()
+    fake.ready = {1000: False, 2000: True}
+    _cm, pm = _build_bypass_managers(fake, num_pages=128)
+    pm.pending_list = [_pending(1, 1000), _pending(2, 2000)]
+
+    # Head's pages are still warming: the gate blocks on the warm (rank-local,
+    # SPMD-safe) and then the pass admits in FIFO order. No scan-past -- a defer
+    # would let the TP ranks build different batches and deadlock the collectives
+    # (see the SPMD lockstep note in _try_allocate_one).
+    batch = pm.schedule_next_batch(128)
+    assert [r.uid for r in batch.reqs] == [1, 2]
+    assert fake.waited == [1000]  # only the not-ready head blocked
+    assert pm.pending_list == []
+
+
+def test_restore_gate_disabled_skips_probe_and_wait(monkeypatch):
+    from freetoken.scheduler import prefill as prefill_module
+
+    fake = _FakeHostTier()
+    fake.ready = {1000: False, 2000: True}
+    _cm, pm = _build_bypass_managers(fake, num_pages=128)
+    pm.pending_list = [_pending(1, 1000), _pending(2, 2000)]
+
+    # Knob off: the probe is never consulted and the wait never runs; admission
+    # goes straight to match_req, which blocks on warms the same way.
+    monkeypatch.setattr(prefill_module, "_RESTORE_BYPASS", False)
+    batch = pm.schedule_next_batch(128)
+    assert [r.uid for r in batch.reqs] == [1, 2]
+    assert fake.waited == []
+    assert pm.pending_list == []
+
+
+def test_restore_ready_probes_on_empty_swa_match():
+    # Regression: SWAMatch has no cuda_handle, so the empty-GPU-match case (the
+    # common one after filler eviction) must still reach the probe instead of
+    # dying on the getattr fallback and silently defaulting to ready.
+    from freetoken.kvcache.swa_radix_cache import SWAMatch
+    from freetoken.scheduler.cache import CacheManager
+
+    class _SwaEmptyTree:
+        def match_prefix(self, input_ids):
+            return SWAMatch(torch.zeros(0, dtype=torch.int32), 0, object())
+
+    fake = _FakeHostTier()
+    fake.ready = {1000: False}
+    pt = torch.zeros((5, 64), dtype=torch.int32, device="cpu")
+    cm = CacheManager(num_pages=64, page_size=1, page_table=pt, type="radix",
+                      host_prefix_cache=fake)
+    cm.prefix_cache = _SwaEmptyTree()
+    req = _pending(1, 1000)
+
+    assert cm.restore_ready(req) is False
+    fake.ready[1000] = True
+    assert cm.restore_ready(req) is True

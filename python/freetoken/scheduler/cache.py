@@ -456,6 +456,43 @@ class CacheManager:
         except Exception as exc:
             logger.warning("DSV4 host prefix prefetch failed: %r", exc)
 
+    def restore_ready(self, req) -> bool:
+        """True when admitting this request cannot stall on a DSV4 host restore.
+        Metadata-only; any probe error defaults to ready so admission never depends
+        on the probe. Only the DSV4/SWA tier is gated: the plain-radix host path
+        (PrefixTier) has no prefetch futures to poll."""
+        host = self.host_prefix_cache
+        if host is None or not getattr(host, "supports_dsv4", False):
+            return True
+        try:
+            ids = req.input_ids[: req.input_len - 1]
+            mr = self.prefix_cache.match_prefix(ids)
+            # The SWA tree surfaces cached_len on its MatchResult; the plain radix
+            # tree carries it on the handle. Either way this is a metadata walk.
+            # (SWAMatch has no cuda_handle, so the fallback must not touch it when
+            # cached_len exists -- an empty GPU match is the common pass2on case.)
+            cached = getattr(mr, "cached_len", None)
+            gpu_matched = int(cached) if cached is not None else int(mr.cuda_handle.cached_len)
+            return host.prefetch_ready(ids, start=gpu_matched)
+        except Exception:
+            return True
+
+    def wait_restore(self, req) -> None:
+        """Block until this request's in-flight DSV4 host warms finish (rank-local).
+
+        CPU-only wait on the prefetch futures; never submits CUDA work. Called by the
+        prefill admission scan right after a not-ready probe: probe_ready has already
+        re-kicked any missing warm, so this either joins a live future or falls
+        through (failed warm) and match_req's synchronous restore owns the disk
+        fallback and its restore_failures accounting."""
+        host = self.host_prefix_cache
+        if host is None or not getattr(host, "supports_dsv4", False):
+            return
+        try:
+            host.wait_prefetch(req.input_ids[: req.input_len - 1])
+        except Exception as exc:
+            logger.warning("DSV4 host restore wait failed: %r", exc)
+
     def _restore_dsv4_host_prefix(self, req, handle):
         """Restore a DSV4 host prefix and publish it through the live SWA radix tree.
 
