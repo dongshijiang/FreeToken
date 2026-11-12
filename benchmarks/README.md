@@ -35,5 +35,18 @@ and cross-NUMA DRAM read. Linux-only (sysfs topology + `sched_setaffinity`); tur
 python benchmarks/bench_numa_bw.py --gpu 0
 ```
 
+**`bench_gds_page.py`** — GDS raw-page write/read vs the host-staged CPU path vs the
+legacy torch.save path, at DSV4 page scale (~17MB, ~170 tensors). Needs CUDA, a
+loaded `nvidia_fs` module and a non-LVM disk-backed `--dir` (raw NVMe, e.g.
+`/mnt/kvcache`); cuFile does not serve tmpfs or device-mapper mounts. Verify the
+active cuFile mode in `/tmp/cufile.log` and `/etc/cufile.json` before comparing
+machines — `fs: posix` routes reads through the page cache and the warm numbers
+stop being disk numbers.
+
+```bash
+sudo env PYTHONPATH=python:. CUDA_VISIBLE_DEVICES=0 \
+  python benchmarks/bench_gds_page.py --dir /mnt/kvcache/ft-gds-bench --drop-caches
+```
+
 For host RAM vs PCIe bandwidth and the offload/hybrid backend pick, use `ft bench bw`
 instead — it writes the JSON profile the engine reads.
