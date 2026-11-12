@@ -129,6 +129,12 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
             if args.tp_info.is_primary():
                 print()  # for a clean newline after ^C
                 logger.info("Scheduler exiting gracefully...")
+        except BaseException:
+            # Log BEFORE the finally-shutdown: a wedged torch.cuda.synchronize inside
+            # shutdown() would otherwise swallow the traceback forever (observed on
+            # 2xL20: rank0 crashed mid-run, hung in shutdown, peer hung in forward).
+            logger.exception("scheduler run_forever crashed")
+            raise
         finally:
             # Persist HiCache host pages on every orderly worker exit, including SIGTERM
             # from the API shutdown path.

@@ -48,7 +48,7 @@ from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .mm import cut_image_spans, plan_mm_batch
-from .prefill import ChunkedReq, PrefillManager
+from .prefill import ChunkedReq, PrefillManager, trace_event
 from .status import SchedulerStatusReporter
 from .table import TableManager
 
@@ -106,6 +106,7 @@ class Scheduler(SchedulerIOMixin):
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
             host_prefix_cache=self._create_host_prefix_cache(config),
             host_write_policy=config.host_prefix_cache_write_policy,
+            tp_cpu_group=self.engine.tp_cpu_group,
         )
         self.decode_manager = DecodeManager(config.page_size)
         self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
@@ -738,6 +739,7 @@ class Scheduler(SchedulerIOMixin):
                 tombstones.pop(next(iter(tombstones)))
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
+            trace_event("abort", uid=msg.uid, found=req_to_free is not None)
             if (
                 req_to_free is not None
                 and req_to_free.mm_items
@@ -820,6 +822,9 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.cache_req(req, finished=True)
         self.table_manager.free(req.table_idx)
         req.table_idx = -1
+        # Diagnostic: per-rank free stream, diffed across ranks to catch a
+        # rank-local release that would fork the two schedulers' KV ledgers.
+        trace_event("free_req", uid=req.uid, cached_len=int(req.cached_len))
 
     def _reply_rebuild(self, request_id: str, status: str, error: str | None = None) -> None:
         # Single source of truth with the rollback snapshot (_current_cache_geometry): mamba is

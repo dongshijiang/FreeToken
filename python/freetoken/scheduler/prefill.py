@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from freetoken.core import Batch, Req
+from freetoken.distributed import try_get_tp_info
 from freetoken.utils import align_down, div_ceil, init_logger
 
 from .mm import mm_chunk_end, mm_rows_after
@@ -49,26 +50,57 @@ _KV_OUTPUT_RESERVE = int(os.environ.get("FREETOKEN_KV_OUTPUT_RESERVE", "0") or 0
 _RESTORE_BYPASS = os.environ.get("FREETOKEN_RESTORE_BYPASS", "1") != "0"
 
 
+def _trace_rank() -> int:
+    """TP rank for trace attribution. os.environ["RANK"] is unset in spawn workers,
+    which collapsed both ranks' lines into one unattributable file (observed while
+    bisecting the S2 wedge); read it from the engine's DistributedInfo instead."""
+    ti = try_get_tp_info()
+    return ti.rank if ti is not None else -1
+
+
 def _trace_schedule(mgr, adder, reqs, failed_uid) -> None:
     global _trace_fh
     if _trace_fh is None:
-        rank = os.environ.get("RANK", "x")
-        _trace_fh = open(f"/tmp/sched_trace_r{rank}.jsonl", "a", buffering=1)
+        _trace_fh = open(f"/tmp/sched_trace_r{_trace_rank()}.jsonl", "a", buffering=1)
     cm = mgr.cache_manager
     pool = getattr(cm, "linear_state_pool", None)
+    # kv_avail = evictable (radix-cached) + free; log both so a divergence names
+    # its currency: evictable moved => tree insert/evict diverged, free moved =>
+    # allocator release diverged.
+    evictable = (cm.prefix_cache.full_evictable_size
+                 if (cm.is_hybrid or cm.is_swa)
+                 else cm.prefix_cache.size_info.evictable_size)
     rec = {
         "t": round(time.time(), 4),
+        "rank": _trace_rank(),
         "added": [(r.uid, r.extend_len) for r in reqs],
         "fail": failed_uid,
         "budget": adder.pass_budget,
         "token_budget_left": adder.token_budget,
         "inflight": adder.reserved_size,
         "kv_avail": cm.available_size,
+        "evictable": evictable,
+        "free_pages": len(cm.free_slots),
         "swa_avail": getattr(cm, "swa_available_size", None),
         "gdn_free": pool.num_free_slots if pool is not None else None,
         "pending": [p.uid for p in mgr.pending_list],
     }
     _trace_fh.write(json.dumps(rec) + "\n")
+
+
+def trace_event(kind: str, **fields) -> None:
+    """Append a scheduler lifecycle event (request free/abort/...) to this rank's
+    sched trace file, so per-rank event streams can be diffed to find the first
+    divergence. Best-effort: tracing must never break scheduling."""
+    global _trace_fh
+    try:
+        if _trace_fh is None:
+            _trace_fh = open(f"/tmp/sched_trace_r{_trace_rank()}.jsonl", "a", buffering=1)
+        rec = {"t": round(time.time(), 4), "rank": _trace_rank(), "ev": kind}
+        rec.update(fields)
+        _trace_fh.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
 
 
 def _maybe_pinned(t: torch.Tensor) -> torch.Tensor:

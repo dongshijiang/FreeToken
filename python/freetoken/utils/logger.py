@@ -83,6 +83,15 @@ def init_logger(
             colored_level = f"{level_color}{record.levelname:<8}{self.RESET}"
             message = record.getMessage()
 
+            # logging.Formatter.format() normally appends the traceback text
+            # (record.exc_text); this override bypasses it, which silently
+            # dropped every logger.exception() traceback down to message-only.
+            # Mirror the base behavior: format once, cache on the record.
+            if record.exc_info and not record.exc_text:
+                record.exc_text = self.formatException(record.exc_info)
+            if record.exc_text:
+                message = f"{message}\n{record.exc_text}"
+
             # Pretty format: [timestamp] LEVEL message
             return f"{self.BOLD}{timestamp}{self.RESET} {colored_level} {message}"
 

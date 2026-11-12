@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from collections import deque
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -35,7 +34,8 @@ logger = init_logger(__name__)
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None,
-                 host_prefix_cache=None, host_write_policy: str = "write_through"):
+                 host_prefix_cache=None, host_write_policy: str = "write_through",
+                 tp_cpu_group=None):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -61,6 +61,10 @@ class CacheManager:
         # copy to GPU-radix eviction time; only the DSV4/SWA path implements it -- every
         # other family silently keeps write_through (the tier has no eviction hook there).
         self.host_write_policy = host_write_policy
+        # TP process group for SPMD lockstep of the restore paths (see _tp_min). None
+        # keeps the old single-rank behavior (tests, offline).
+        self.tp_cpu_group = tp_cpu_group
+        self._tp_size = self._tp_world_size()
         self._host_write_back = (
             host_write_policy == "write_back"
             and self.is_swa
@@ -95,16 +99,83 @@ class CacheManager:
         self.kv_stat_requests = 0
         self.kv_stat_prompt_tokens = 0
         self.kv_stat_cached_tokens = 0
-        # Async host write-through: the tier's writer thread appends (tree, node, swa_uuid)
-        # here once a put's gather finished; the SCHEDULER thread applies the dec_lock
-        # (the radix tree is otherwise single-threaded) at the drain points below.
-        self._host_releases: deque = deque()
+        # Async host write-through: each enqueued put's tree pin gets a sequence
+        # number; the tier's writer thread records (seq -> (tree, node, swa_uuid))
+        # here once that put's gather finished. The SCHEDULER thread applies the
+        # dec_locks (the radix tree is otherwise single-threaded) -- but only up
+        # to the TP-negotiated MIN prefix (see _drain_host_releases).
+        self._host_put_seq = 0
+        self._host_release_applied = 0
+        self._host_releases: dict[int, tuple] = {}
+
+    def _tp_world_size(self) -> int:
+        """1 without TP sync, else the TP group's world size."""
+        group = self.tp_cpu_group
+        if group is None or not (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            return 1
+        return torch.distributed.get_world_size(group=group)
+
+    def _tp_min(self, value: int) -> int:
+        """Smallest ``value`` across the TP group; ``value`` unchanged without TP sync.
+
+        The host tier's eviction timeline is rank-local (async put completion timing
+        drifts the drop-eviction sequences), so a rank-local restore length publishes
+        different radix prefixes per rank and the next NCCL collective never pairs up:
+        both ranks wedge mid-forward. The restore paths route every rank-local length
+        through this MIN so each rank publishes exactly the prefix every rank can
+        serve. CPU gloo tensor only -- never submits CUDA work."""
+        group = self.tp_cpu_group
+        if group is None or not (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group=group) > 1
+        ):
+            return value
+        t = torch.tensor([int(value)], dtype=torch.int64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=group)
+        return int(t.item())
 
     def _drain_host_releases(self) -> None:
-        """Apply tree-pin releases the async host put writer has finished."""
-        releases = self._host_releases
-        while releases:
-            tree, node, swa_uuid = releases.popleft()
+        """Apply tree-pin releases for the async host puts both ranks have finished.
+
+        A release arrives at a RANK-LOCAL time (each rank's writer gathers at its
+        own pace), and dec_lock moves the pinned node back into full_evictable --
+        accounting both ranks' admission reads. Applying releases as they arrive
+        locally makes available_size rank-local for as long as the gather gap
+        lasts; an admission gate landing inside that window then admits on one
+        rank and refuses on the other, the schedulers fork, and the next NCCL
+        collective never pairs (observed on 2xL20: evictable differing by one
+        finished request's KV while free_pages matched). Same cure as sglang's
+        TP-lockstep contract (buffer_mode/pipeline.py): report the longest prefix
+        of pins that is locally released, all_reduce MIN it, and both ranks apply
+        exactly that prefix at the same scheduler point. The gather I/O itself
+        stays asynchronous and rank-local -- only the accounting is synchronized.
+        """
+        applied = self._host_release_applied
+        if applied == self._host_put_seq:
+            return  # no pin outstanding -> nothing to negotiate (skip the allreduce)
+        ready = applied
+        while ready in self._host_releases:
+            ready += 1
+        ready = self._tp_min(ready)
+        while applied < ready:
+            tree, node, swa_uuid = self._host_releases.pop(applied)
+            applied += 1
+            try:
+                tree.dec_lock(node, swa_uuid)
+            except Exception as exc:
+                logger.warning("host put pin release failed: %r", exc)
+        self._host_release_applied = applied
+
+    def _apply_all_host_releases(self) -> None:
+        """Drain every LOCAL release without TP negotiation. Shutdown/rebuild only:
+        the peer's drains stop mattering there, and waiting on it could hang."""
+        while self._host_release_applied in self._host_releases:
+            tree, node, swa_uuid = self._host_releases.pop(self._host_release_applied)
+            self._host_release_applied += 1
             try:
                 tree.dec_lock(node, swa_uuid)
             except Exception as exc:
@@ -115,7 +186,7 @@ class CacheManager:
         host = self.host_prefix_cache
         if host is not None and getattr(host, "supports_async", False):
             host.wait_puts()
-        self._drain_host_releases()
+        self._apply_all_host_releases()
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -207,6 +278,9 @@ class CacheManager:
         try:
             host_len = host.match_len(ids)
             target = min(host_len, align_down(len(ids), self.page_size))
+            # SPMD lockstep (see _tp_min): agree on the restore length before either
+            # rank touches its radix tree; a rank-local skip would fork the trees.
+            target = self._tp_min(target)
             if target <= start:
                 return handle
             restore_tokens = target - start
@@ -221,7 +295,13 @@ class CacheManager:
             try:
                 allocated = self._allocate(pages)
                 new_locs = self._page_to_token(allocated)
-                restored = host.get(ids, new_locs, start=start)
+                try:
+                    raw_restored = host.get(ids, new_locs, start=start)
+                except Exception:
+                    # Rank-local I/O failure: the MIN below agrees both ranks on the
+                    # matched-only prefix, so the publishes stay identical.
+                    raw_restored = start
+                restored = self._tp_min(raw_restored)
                 if restored < target:
                     # This can only happen if the host page disappeared under us; the
                     # pages are still valid and will be published for the restored length.
@@ -464,6 +544,9 @@ class CacheManager:
         host = self.host_prefix_cache
         if host is None or not getattr(host, "supports_dsv4", False):
             return True
+        # Compute the LOCAL readiness with the vote OUTSIDE the try: a rank-local
+        # exception must not skip the all_reduce, or the two ranks' gloo call
+        # sequences go out of step and every later collective mispairs.
         try:
             ids = req.input_ids[: req.input_len - 1]
             mr = self.prefix_cache.match_prefix(ids)
@@ -473,9 +556,14 @@ class CacheManager:
             # cached_len exists -- an empty GPU match is the common pass2on case.)
             cached = getattr(mr, "cached_len", None)
             gpu_matched = int(cached) if cached is not None else int(mr.cuda_handle.cached_len)
-            return host.prefetch_ready(ids, start=gpu_matched)
+            local = host.prefetch_ready(ids, start=gpu_matched)
         except Exception:
-            return True
+            local = True
+        # Prefetch futures complete at rank-local times (each rank warms its own
+        # host copy). A raw local False would defer admission here while the
+        # peer admits -- the same scheduler fork the async-put pin causes. MIN
+        # the ready flag so both ranks defer together and admit together.
+        return self._tp_min(0 if local else 1) == 0
 
     def wait_restore(self, req) -> None:
         """Block until this request's in-flight DSV4 host warms finish (rank-local).
@@ -527,9 +615,20 @@ class CacheManager:
             windowless = False
             if target <= int(handle.cached_len):
                 wl = align_down(host.match_len(ids), P) - P
-                if wl <= int(handle.cached_len):
-                    return handle
-                target, windowless = wl, True
+                target, windowless = max(wl, 0), True
+            # SPMD lockstep: agree on the packed (target, windowless) before either
+            # rank touches its radix tree. MIN prefers windowless on ties -- the only
+            # publish shape that is safe against either page layout (windowless
+            # publishing of window-carrying pages merely drops their swa slots; a
+            # windowed publish of window-less pages would leave a live leaf whose
+            # window KV does not exist). A rank whose candidate cannot extend past
+            # the GPU match packs 0, so every rank skips together.
+            packed = self._tp_min(target * 2 + (0 if windowless else 1))
+            target, windowless = packed // 2, packed % 2 == 0
+            if target <= int(handle.cached_len):
+                # Some rank cannot extend the GPU prefix past here; skipping is the
+                # only decision every rank can execute identically.
+                return handle
             # Chunked prefill re-matches on every step; count each request once so the
             # eligible denominator stays per-request (retries within one request must
             # not inflate it under swa-slot pressure).
@@ -571,7 +670,20 @@ class CacheManager:
                             self.swa_pool.alloc_swa(full_locs[run_start * P: (prev + 1) * P])
                             run_start = idx
                         prev = idx
-                restored = host.get(ids, full_locs)
+                get_failed = False
+                try:
+                    raw_restored = host.get(ids, full_locs)
+                except Exception:
+                    # Rank-local I/O failure: agree on 0 through the MIN below so both
+                    # ranks skip the publish together (count the failure locally).
+                    raw_restored, get_failed = 0, True
+                restored = self._tp_min(raw_restored)
+                if get_failed:
+                    host.stats.restore_failures += 1
+                if restored <= 0:
+                    self.swa_pool.free_swa(full_locs)
+                    self._free(full_locs)
+                    return handle
                 if restored < target:
                     extra = full_locs[restored:]
                     if extra.numel():
@@ -916,8 +1028,15 @@ class CacheManager:
             return
         try:
             if (
-                getattr(host, "supports_async", False)
-                and not host.saturated
+                # TP keeps the synchronous put. The async pin's release timing is
+                # rank-local and, even with the seq/MIN drain below making the
+                # ACCOUNTING symmetric, any other stall longer than the gloo group
+                # timeout (60s default) makes a peer's MIN vote / broadcast time
+                # out and crash both ranks (observed on 2xL20 at 17:08:56: traces
+                # byte-identical, one rank stalled, the peer's collective threw).
+                # Fewer collective sites in TP = fewer pairing hazards; revisit with
+                # a raised --distributed-timeout before re-enabling.
+                self._tp_size <= 1
                 and self._enqueue_async_host_put(req, insert_len)
             ):
                 return
@@ -935,16 +1054,30 @@ class CacheManager:
         un-evicted and un-tombstoned while the background gather reads them; evict,
         evict_swa and trim_head_swa all skip locked nodes, and insert's revive path
         explicitly preserves the slots of a full-locked reader. Returns False (nothing
-        enqueued, no pin taken) when the tree does not reach the full insert boundary;
-        the caller then falls back to a synchronous put."""
+        enqueued, no pin taken) when the put must run synchronously instead: the tree
+        does not reach the full insert boundary, the writer is saturated, or the TP
+        group voted the fallback. The async/sync choice itself must be rank-synchronized
+        -- a pin held on one rank only is exactly the available_size fork the seq/MIN
+        release drain below exists to prevent -- so eligibility is MIN-voted across the
+        TP group before any pin is taken."""
         host = self.host_prefix_cache
         tree = self.prefix_cache
-        if not hasattr(tree, "match_prefix_full"):
-            return False
-        node, matched = tree.match_prefix_full(req.input_ids[:insert_len])
-        if matched != insert_len:
+        node, matched = (
+            tree.match_prefix_full(req.input_ids[:insert_len])
+            if hasattr(tree, "match_prefix_full")
+            else (None, -1)
+        )
+        eligible = (
+            node is not None
+            and matched == insert_len
+            and getattr(host, "supports_async", False)
+            and not host.saturated
+        )
+        if self._tp_min(0 if eligible else 1) != 0:
             return False
         swa_uuid = tree.inc_lock(node)
+        seq = self._host_put_seq
+        self._host_put_seq += 1
         released = False
 
         def release() -> None:
@@ -952,7 +1085,7 @@ class CacheManager:
             if released:
                 return
             released = True
-            self._host_releases.append((tree, node, swa_uuid))
+            self._host_releases[seq] = (tree, node, swa_uuid)
 
         try:
             # Record the commit boundary on the engine stream: the tier's writer waits

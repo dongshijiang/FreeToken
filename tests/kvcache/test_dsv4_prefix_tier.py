@@ -1437,3 +1437,34 @@ def test_restore_ready_probes_on_empty_swa_match():
     assert cm.restore_ready(req) is False
     fake.ready[1000] = True
     assert cm.restore_ready(req) is True
+
+
+def test_host_release_drain_applies_only_ready_prefix():
+    """Seq-numbered async-put pins + prefix drain: a release arriving out of order
+    (sync fallback after the TP eligibility vote, writer reordering) must not jump
+    the queue -- dec_lock order follows pin order, and the drain applies only the
+    longest locally-ready prefix. With no TP group the MIN is the local value."""
+    from freetoken.scheduler.cache import CacheManager
+
+    cm = CacheManager(num_pages=4, page_size=1,
+                      page_table=torch.zeros((2, 4), dtype=torch.int32), type="radix")
+
+    class _FakeTree:
+        def __init__(self):
+            self.unlocked = []
+
+        def dec_lock(self, node, swa_uuid):
+            self.unlocked.append((node, swa_uuid))
+
+    tree = _FakeTree()
+    cm._host_put_seq = 2
+    cm._host_releases = {1: (tree, "n1", 11)}
+    cm._drain_host_releases()
+    assert tree.unlocked == []  # seq 0 still in flight: the prefix stops before it
+
+    cm._host_releases[0] = (tree, "n0", 10)
+    cm._drain_host_releases()
+    assert tree.unlocked == [("n0", 10), ("n1", 11)]  # pin order, not arrival order
+    assert cm._host_release_applied == 2
+    cm._drain_host_releases()  # idempotent once fully applied
+    assert tree.unlocked == [("n0", 10), ("n1", 11)]
