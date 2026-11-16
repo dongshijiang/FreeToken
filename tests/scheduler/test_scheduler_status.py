@@ -155,6 +155,34 @@ def test_interval_is_clamped_to_at_least_one():
     assert rep_neg.decode_log_interval == 1
 
 
+def test_moe_stats_callable_runs_only_on_the_emitting_step():
+    """The moe stats callable syncs the device (decode_miss_stats .item()s), so it must
+    run only on the step whose log line actually renders it. Evaluating it eagerly per
+    step serializes the scheduler against every forward (py-spy: ~90% of the scheduler
+    thread sat in _moe_status at bs1 decode). Passing the callable unevaluated and
+    letting the reporter invoke it keeps the throttle airtight; a plain str is still
+    accepted (and rendered) for callers that already have the string."""
+    rep, logs, clock = _reporter(interval=3)
+    calls = {"n": 0}
+
+    def moe_stats() -> str:
+        calls["n"] += 1
+        return "moe-miss-rate: 0.100"
+
+    for i in range(2):
+        rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0,
+                         kv_used_pages=1, kv_total_pages=10, page_size=1,
+                         moe_stats=moe_stats)
+        assert calls["n"] == 0, f"throttled step {i} must not evaluate the callable"
+        assert logs == []
+    clock["t"] = 1.0
+    rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=10, page_size=1,
+                     moe_stats=moe_stats)
+    assert calls["n"] == 1
+    assert "moe-stats: moe-miss-rate: 0.100, " in logs[-1]
+
+
 def test_usage_ratio_guard():
     assert _usage_ratio(0, 0) == 0.0
     assert _usage_ratio(5, 0) == 0.0

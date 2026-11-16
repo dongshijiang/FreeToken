@@ -34,7 +34,7 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
-        moe_stats: str | None = None,
+        moe_stats: Callable[[], str] | str | None = None,
     ) -> None:
         if batch.is_prefill:
             self._report_prefill(
@@ -103,12 +103,16 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
-        moe_stats: str | None = None,
+        moe_stats: Callable[[], str] | str | None = None,
     ) -> None:
         self._decode_forward_count += 1
         self._decode_generated_tokens += len(batch.reqs)
         if self._decode_forward_count % self.decode_log_interval != 0:
+            # moe_stats stays unevaluated here: it may be a callable that syncs the
+            # device, and 39 of 40 steps never render it (see scheduler._moe_status).
             return
+        if callable(moe_stats):
+            moe_stats = moe_stats()
 
         now = self.clock()
         gap = now - self._last_decode_time

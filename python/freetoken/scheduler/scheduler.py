@@ -577,7 +577,11 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
-            moe_stats=self._moe_status() if moe_cache is not None and moe_cache.collect_stats else None,
+            # Deliberately NOT called here: report_batch invokes it only on the step it
+            # actually logs, and decode_miss_stats() syncs the device -- calling it every
+            # step would serialize the scheduler against each forward (py-spy showed the
+            # eager variant eating ~90% of the scheduler thread at bs1).
+            moe_stats=self._moe_status if moe_cache is not None and moe_cache.collect_stats else None,
         )
         self.send_result(reply)
 
