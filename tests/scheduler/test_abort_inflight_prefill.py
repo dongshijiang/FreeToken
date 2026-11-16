@@ -71,7 +71,7 @@ def _setup():
         _pending_abort_acks=set(),
         _last_data=None,
     )
-    stub._free_req_resources = lambda req: Scheduler._free_req_resources(stub, req)
+    stub._free_req_resources = lambda req, ready=None: Scheduler._free_req_resources(stub, req, ready=ready)
     return pool, cm, tm, dm, pm, sent, stub
 
 

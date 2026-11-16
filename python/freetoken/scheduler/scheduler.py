@@ -450,14 +450,14 @@ class Scheduler(SchedulerIOMixin):
                         # Aborted mid-chunked-prefill while this chunk was in flight: the abort
                         # popped the pending continuation (no next chunk launches), and this
                         # drain point frees the chunk's pages/slots exactly once.
-                        self._free_req_resources(req)
+                        self._free_req_resources(req, ready=copy_done)
                     continue
                 if req.aborted:
                     # Aborted while this final-chunk prefill / decode step was in flight: free
                     # here (the forward is drained) and finish the request. No DetokenizeMsg --
                     # the abort ack flushed after this method stays the uid's terminal reply.
                     self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
+                    self._free_req_resources(req, ready=copy_done)
                     new_finished_reqs.add(req)
                     continue
                 if req in self.finished_reqs:
@@ -507,7 +507,7 @@ class Scheduler(SchedulerIOMixin):
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
                     self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
+                    self._free_req_resources(req, ready=copy_done)
                     new_finished_reqs.add(req)
                 elif batch.is_prefill and req.table_idx != -1:
                     # for prefill, non-chunk req, cache the prefix.
@@ -518,7 +518,10 @@ class Scheduler(SchedulerIOMixin):
                     # never reach this commit -- but if a future path frees one early, skip
                     # rather than re-read the freed page-table row (and on hybrid, deref the
                     # None'd GDN ping-pong slots).
-                    self.cache_manager.cache_req(req, finished=False)
+                    # copy_done covers exactly this batch's KV writes: the host-put gather
+                    # orders after them without over-capturing the scheduler stream (which
+                    # wait_stream'd behind the NEXT batch's forward before we got here).
+                    self.cache_manager.cache_req(req, finished=False, ready=copy_done)
 
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
@@ -809,7 +812,7 @@ class Scheduler(SchedulerIOMixin):
                 pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
                 req.mamba_restore_src = None  # consumed: restore exactly once
 
-    def _free_req_resources(self, req: Req) -> None:
+    def _free_req_resources(self, req: Req, ready: "torch.cuda.Event | None" = None) -> None:
         # Idempotent: an EOS-finished request can stay in running_reqs (output budget left), so an
         # abort in the same overlap iteration races _process_last_data and would free it twice --
         # double-freeing its table_idx and (hybrid) GDN slots onto the free-list, handing the same
@@ -819,7 +822,7 @@ class Scheduler(SchedulerIOMixin):
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
-        self.cache_manager.cache_req(req, finished=True)
+        self.cache_manager.cache_req(req, finished=True, ready=ready)
         self.table_manager.free(req.table_idx)
         req.table_idx = -1
         # Diagnostic: per-rank free stream, diffed across ranks to catch a

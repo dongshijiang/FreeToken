@@ -38,6 +38,11 @@ logger = init_logger(__name__)
 class DSV4PrefixTierStats:
     put_requests: int = 0
     put_pages: int = 0
+    # Puts skipped at ISSUE time because the tier provably cannot hold them
+    # (host full of locked pages, nothing evictable): skips the whole gather +
+    # event wait the writer would otherwise pay before dying in
+    # _ensure_host_capacity ("no evictable page").
+    put_skipped_capacity: int = 0
     restore_pages: int = 0
     restore_failures: int = 0
     # Request-level hit-rate counters: eligible = GPU miss with a longer host prefix,
@@ -180,11 +185,27 @@ class DSV4PrefixTier:
         )
         self._put_futures: set[Future] = set()
         self._pending_puts = 0
+        # Pinned staging bytes issued but not yet reassembled by the writer; the
+        # second leg of `saturated` (alongside _pending_puts). Freed only on the
+        # scheduler thread via drain_put_recycles, so the budget bounds how much
+        # pinned memory a burst of puts can hold between drains.
+        self._pinned_inflight_bytes = 0
+        self._pin_budget = max(
+            0, int(os.environ.get("FREETOKEN_PUT_PIN_BUDGET", str(2 * 1024**3))))
         # Bumped by clear(); an in-flight put whose generation no longer matches is
         # dropped instead of resurrecting stale pages into the fresh index.
         self._generation = 0
+        # FREETOKEN_PREFETCH_WORKERS>1 parallelizes disk->host warms so a burst
+        # of deferred admissions does not serialize behind one worker's reads
+        # (18.3 MiB pages each). The reads themselves are stateless
+        # (read_page_cpu / torch.load) and every warm inserts under the tier
+        # lock, so extra workers are safe; stats counters (disk_reads) may lose
+        # updates under contention (diagnostics only). _drop_page's
+        # cancel-instead-of-join and _warm_page's insert re-check below are what
+        # make >1 worker legal.
         self._prefetch_pool = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="dsv4-prefix-prefetch"
+            max_workers=max(1, int(os.environ.get("FREETOKEN_PREFETCH_WORKERS", "1"))),
+            thread_name_prefix="dsv4-prefix-prefetch",
         )
         self._prefetch_writes: dict[int, Future] = {}
         self._closed = False
@@ -267,6 +288,7 @@ class DSV4PrefixTier:
             "disk_pages": len(self.disk_pages),
             "gds_reads": self.stats.gds_reads,
             "pending_puts": self._pending_puts,
+            "pinned_inflight_bytes": self._pinned_inflight_bytes,
             "capacity_pages": self.capacity_pages,
             "disk_capacity_pages": self.disk_capacity_pages,
             **self._put_breakdown_stats(),
@@ -278,7 +300,8 @@ class DSV4PrefixTier:
         if not rows:
             return {}
         out: dict = {"put_samples": len(rows)}
-        for key in ("queue_ms", "event_ms", "lock_ms", "gather_ms", "insert_ms", "total_ms"):
+        for key in ("queue_ms", "event_ms", "lock_ms", "locs_ms", "gather_ms",
+                    "insert_ms", "total_ms"):
             vals = [r[key] for r in rows if key in r]
             if vals:
                 out[f"put_{key}_mean"] = round(sum(vals) / len(vals), 1)
@@ -310,7 +333,13 @@ class DSV4PrefixTier:
         return pct(0.50), pct(0.95)
 
     def match_len(self, token_ids: torch.Tensor) -> int:
-        return int(self.index.match_prefix(self._cpu(token_ids)).cuda_handle.cached_len)
+        ids = self._cpu(token_ids)
+        # Tier lock around every index op: match_prefix can split nodes, and an
+        # unlocked walk racing the locked writer insert saw a mid-split node and
+        # died on split_at's bare assert (observed as "async put failed" twice on
+        # 2xL20 under the pressure cell).
+        with self._lock:
+            return int(self.index.match_prefix(ids).cuda_handle.cached_len)
 
     def restorable_len(self, token_ids: torch.Tensor) -> int:
         """Deepest page boundary whose segment still carries the window tail.
@@ -320,20 +349,26 @@ class DSV4PrefixTier:
         resumption tail. The last page with window KV defines the safe restore boundary.
         """
         ids = self._cpu(token_ids)
-        handle = self.index.match_prefix(ids).cuda_handle
-        matched = int(handle.cached_len)
-        if matched == 0:
-            return 0
-        self.index.lock_handle(handle)
-        try:
+        # Tier lock around ALL index ops: lock_handle moves ref_count/evictable_size,
+        # and doing that unlocked races the locked evict inside _ensure_host_capacity
+        # (a _warm_page worker is NOT covered by the put quiesce) -- index.evict then
+        # pops a just-locked node and dies on its ref_count==0 assert.
+        with self._lock:
+            handle = self.index.match_prefix(ids).cuda_handle
+            matched = int(handle.cached_len)
+            if matched == 0:
+                return 0
+            self.index.lock_handle(handle)
             rows = handle.get_matched_indices()
+        try:
             last_good = -1
             for page_idx, page_id in enumerate(self._page_ids(rows, matched, self.page_size)):
                 if self._page_has_window(page_id):
                     last_good = page_idx
             return (last_good + 1) * self.page_size if last_good >= 0 else 0
         finally:
-            self.index.lock_handle(handle, unlock=True)
+            with self._lock:
+                self.index.lock_handle(handle, unlock=True)
 
     def window_page_positions(self, token_ids: torch.Tensor, target: int) -> list[int]:
         """Positions (0-based, page units) of pages within [0, target) whose snapshot still
@@ -346,20 +381,23 @@ class DSV4PrefixTier:
         if target <= 0:
             return []
         ids = self._cpu(token_ids)[:target]
-        handle = self.index.match_prefix(ids).cuda_handle
-        matched = min(int(handle.cached_len), target)
-        if matched == 0:
-            return []
-        self.index.lock_handle(handle)
-        try:
+        # Tier lock around ALL index ops -- same race as restorable_len above.
+        with self._lock:
+            handle = self.index.match_prefix(ids).cuda_handle
+            matched = min(int(handle.cached_len), target)
+            if matched == 0:
+                return []
+            self.index.lock_handle(handle)
             rows = handle.get_matched_indices()
+        try:
             out = []
             for page_idx, page_id in enumerate(self._page_ids(rows, matched, self.page_size)):
                 if self._page_has_window(page_id):
                     out.append(page_idx)
             return out
         finally:
-            self.index.lock_handle(handle, unlock=True)
+            with self._lock:
+                self.index.lock_handle(handle, unlock=True)
 
     @_timed("prefetch")
     def prefetch(self, token_ids: torch.Tensor, start: int = 0) -> int:
@@ -400,7 +438,16 @@ class DSV4PrefixTier:
                     if page_id in self.host_pages or page_id in self._prefetch_writes:
                         self.stats.prefetch_already_hot += 1
                         continue
-                    future = self._prefetch_pool.submit(self._warm_page, page_id)
+                    # Capture the generation and the metadata OBJECT so a page
+                    # dropped (or dropped and its id reallocated) while the warm
+                    # is queued/running cannot have its stale payload inserted:
+                    # _warm_page re-validates both under the lock before the
+                    # insert (clear() bumps the generation, _drop_page swaps the
+                    # metadata dict).
+                    future = self._prefetch_pool.submit(
+                        self._warm_page, page_id,
+                        self._generation, self.page_metadata.get(page_id),
+                    )
                     self._prefetch_writes[page_id] = future
                     scheduled += 1
                 self.stats.prefetch_scheduled += scheduled
@@ -429,7 +476,11 @@ class DSV4PrefixTier:
                 ]
         # Never hold the tier lock while waiting: _warm_page needs it to insert the page.
         for future in futures:
-            future.result()
+            # Futures popped here cannot have been cancelled by _drop_page (it
+            # pops from the same dict under the same lock), but guard the join
+            # anyway: a cancelled warm raises CancelledError on .result().
+            if not future.cancelled():
+                future.result()
 
     def prefetch_ready(self, token_ids: torch.Tensor, start: int = 0) -> bool:
         """Non-blocking restore-readiness probe: True when a get() over this prefix
@@ -488,7 +539,8 @@ class DSV4PrefixTier:
 
     @property
     def saturated(self) -> bool:
-        return self._pending_puts >= self.ASYNC_PUT_QUEUE_LIMIT
+        return (self._pending_puts >= self.ASYNC_PUT_QUEUE_LIMIT
+                or self._pinned_inflight_bytes >= self._pin_budget)
 
     @_timed("put")
     def put(self, token_ids: torch.Tensor, full_locs: torch.Tensor) -> int:
@@ -503,6 +555,18 @@ class DSV4PrefixTier:
         with self._lock:
             if self._closed:
                 return 0
+            # Same early doom check as put_async: without it the sync fallback pays
+            # the gather INLINE on the scheduler thread before dying at insert.
+            # Host-only tiers only: with disk backing the capacity loop spills to
+            # disk instead of evicting, so an empty evictable set is survivable.
+            if self.disk_dir is None:
+                evictable = self.index.size_info.evictable_size // self.page_size
+                needed_evict = (
+                    len(self.host_pages) + aligned // self.page_size - self.capacity_pages
+                )
+                if needed_evict > evictable:
+                    self.stats.put_skipped_capacity += 1
+                    return 0
             generation = self._generation
             self._pending_puts += 1
         try:
@@ -510,8 +574,18 @@ class DSV4PrefixTier:
                                   None, None, generation)
             if job is None:
                 return 0
-            fut = self._put_pool.submit(self._complete_put, job)
-            self._track_put(fut)
+            # Hold the staging bytes BEFORE submitting: once the writer runs, its
+            # finally unconditionally releases them.
+            with self._lock:
+                self._pinned_inflight_bytes += job["pin_bytes"]
+            try:
+                fut = self._put_pool.submit(self._complete_put, job)
+                self._track_put(fut)
+            except RuntimeError:
+                with self._lock:
+                    self._pending_puts -= 1
+                    self._pinned_inflight_bytes -= job["pin_bytes"]
+                return 0  # pool already shut down
             return int(fut.result())
         except RuntimeError:
             with self._lock:
@@ -543,6 +617,7 @@ class DSV4PrefixTier:
             if release is not None:
                 release()
             return 0
+        skip = False
         with self._lock:
             if self._closed:
                 if release is not None:
@@ -550,7 +625,31 @@ class DSV4PrefixTier:
                 return 0
             matched = int(self.index.match_prefix(ids[:aligned]).cuda_handle.cached_len)
             generation = self._generation
-            self._pending_puts += 1
+            if matched < aligned:
+                # Early doom check: a put lands only if the tier can make room for
+                # its pages at insert time, i.e. evicting max(0, host + pages - cap)
+                # pages must be possible. Under a working set that locks the whole
+                # tier (1GiB tier, many concurrent prompts) every put would pay the
+                # full gather + event wait and then die in _ensure_host_capacity
+                # ("no evictable page"; 662 dropped puts in the P4 pressure pass).
+                # The put is a best-effort cache fill, so skipping is free.
+                # Host-only tiers only: with disk backing the capacity loop
+                # spills to disk instead of evicting (never fails), so an empty
+                # evictable set does NOT doom the put there.
+                if self.disk_dir is None:
+                    evictable = self.index.size_info.evictable_size // self.page_size
+                    needed_evict = (
+                        len(self.host_pages) + aligned // self.page_size - self.capacity_pages
+                    )
+                    if needed_evict > evictable:
+                        self.stats.put_skipped_capacity += 1
+                        skip = True
+            if not skip:
+                self._pending_puts += 1
+        if skip:
+            if release is not None:
+                release()
+            return 0
         if matched >= aligned:
             with self._lock:
                 self._pending_puts -= 1
@@ -575,11 +674,16 @@ class DSV4PrefixTier:
                 release()
             return 0
         try:
+            with self._lock:
+                # Hold the staging bytes BEFORE submitting: once the writer runs,
+                # its finally unconditionally releases them.
+                self._pinned_inflight_bytes += job["pin_bytes"]
             fut = self._put_pool.submit(self._complete_put, job)
             self._track_put(fut)
         except RuntimeError:
             with self._lock:
                 self._pending_puts -= 1
+                self._pinned_inflight_bytes -= job["pin_bytes"]
             if release is not None:
                 release()
             raise
@@ -608,6 +712,13 @@ class DSV4PrefixTier:
             except Exception:
                 pass  # _complete_put already logged the failure
 
+    def drain_put_recycles(self) -> None:
+        """SCHEDULER thread: free the pinned staging and done events of gathers the
+        writer has already reassembled. Only this thread may release them -- pinned
+        deallocation touches the caching host allocator, so it must stay off the
+        writer (and off any thread that could race a CUDA submission)."""
+        self.pool.drain_pack_recycle()
+
     def _ensure_gather_stream(self) -> "torch.cuda.Stream | None":
         """One shared low-priority gather stream: it yields the copy engines to the
         engine stream (put DMA jumping the engine's queue delays first tokens;
@@ -627,9 +738,11 @@ class DSV4PrefixTier:
         """Runs on the SCHEDULER thread. Matches the tier index (CPU-only snapshot for
         the gather range; the writer re-matches under the tier lock before inserting,
         so puts that landed in between are honored), freezes the source locs, and
-        issues the whole gather as async CUDA ops on the shared low-priority gather
-        stream. Returns the job for _complete_put, or None when everything is already
-        cached (``release`` already handled)."""
+        issues the gather as async CUDA ops on the shared low-priority gather stream:
+        per-run non_blocking D2H into a per-job pinned staging plus one done event,
+        with NO stream sync here -- the writer waits the event. Returns the job for
+        _complete_put, or None when everything is already cached (``release`` already
+        handled)."""
         t0 = time.perf_counter()
         aligned = len(ids)
         # Phase 1: snapshot the gather range. No lock held past this point: the
@@ -639,15 +752,36 @@ class DSV4PrefixTier:
             t_lock0 = time.perf_counter()
             matched = int(self.index.match_prefix(ids).cuda_handle.cached_len)
             t_lock_ms = (time.perf_counter() - t_lock0) * 1e3
+        t_locs0 = time.perf_counter()
         locs = full_locs[:aligned].detach().to("cpu", dtype=torch.int64).contiguous()
+        locs_ms = (time.perf_counter() - t_locs0) * 1e3
         if len(locs) < aligned:
             raise ValueError("DSV4 prefix tier put got fewer full locs than token ids")
         page_starts = [
             start for start in range(matched, aligned, self.page_size)
             if min(start + self.page_size, aligned) - start == self.page_size
         ]
+        # Split the pages into contiguous full-pool runs: one plan + one D2H batch
+        # per run instead of ~15 device ops per page.
+        runs: list[tuple[list[int], torch.Tensor]] = []
+        run0 = 0
+        while run0 < len(page_starts):
+            base = int(locs[page_starts[run0]])
+            run1 = run0 + 1
+            while (
+                run1 < len(page_starts)
+                and int(locs[page_starts[run1]])
+                == base + (run1 - run0) * self.page_size
+            ):
+                run1 += 1
+            runs.append((
+                list(page_starts[run0:run1]),
+                locs[page_starts[run0]:page_starts[run1 - 1] + self.page_size],
+            ))
+            run0 = run1
         stream = self._ensure_gather_stream()
-        payloads: list[dict] = []
+        built: list[tuple[list[int], dict]] = []   # (run page starts, pool ticket)
+        pin_bytes = 0
         t_gather0 = time.perf_counter()
         if stream is not None:
             with torch.cuda.stream(stream):
@@ -659,77 +793,87 @@ class DSV4PrefixTier:
                     ev = torch.cuda.Event()
                     ev.record()
                     stream.wait_event(ev)
-                run0 = 0
-                while run0 < len(page_starts):
-                    base = int(locs[page_starts[run0]])
-                    run1 = run0 + 1
-                    while (
-                        run1 < len(page_starts)
-                        and int(locs[page_starts[run1]])
-                        == base + (run1 - run0) * self.page_size
-                    ):
-                        run1 += 1
-                    run_locs = locs[
-                        page_starts[run0]:page_starts[run1 - 1] + self.page_size
-                    ]
-                    try:
-                        # Synchronous per-slice gather (stream-syncs at the end):
-                        # the packed single-staging-copy variant wedged the driver
-                        # six times -- see pool.gather_prefix_pages.
-                        payloads.extend(self.pool.gather_prefix_pages(run_locs))
-                    except AssertionError:
-                        seg = run_locs.tolist()
-                        seg_base = seg[0]
-                        bad = [i for i, v in enumerate(seg) if v != seg_base + i]
-                        logger.error(
-                            "DSV4 HiCache put non-contiguous run pages [%d,%d) "
-                            "matched=%d: base=%d first16=%s first_bad_off=%s",
-                            page_starts[run0], page_starts[run1 - 1] + self.page_size,
-                            matched, seg_base, seg[:16], bad[:4],
-                        )
-                        raise
-                    run0 = run1
+                try:
+                    for run_starts, run_locs in runs:
+                        try:
+                            # Per-slice non_blocking D2H into a per-job pinned staging
+                            # + one done event, NO sync (the writer waits). NOT the
+                            # packed GPU->GPU staging variant: that wedged the driver
+                            # six times -- see pool.gather_prefix_pages.
+                            ticket = self.pool._plan_prefix_run(run_locs)
+                            self.pool.issue_prefix_copies(ticket)
+                        except AssertionError:
+                            seg = run_locs.tolist()
+                            seg_base = seg[0]
+                            bad = [i for i, v in enumerate(seg) if v != seg_base + i]
+                            logger.error(
+                                "DSV4 HiCache put non-contiguous run pages [%d,%d) "
+                                "matched=%d: base=%d first16=%s first_bad_off=%s",
+                                run_starts[0], run_starts[-1] + self.page_size,
+                                matched, seg_base, seg[:16], bad[:4],
+                            )
+                            raise
+                        built.append((run_starts, ticket))
+                        pin_bytes += ticket["pack"]["nbytes"]
+                except BaseException:
+                    # The job (and its byte accounting) never happens, so nothing
+                    # else would free the staging of runs already issued; queue the
+                    # packs for the scheduler's recycle drain (we ARE the scheduler
+                    # thread, but drain_put_recycles keeps the invariant in one place).
+                    for _rs, tk in built:
+                        pack = tk.get("pack")
+                        if pack is not None:
+                            self.pool._pack_recycle.append(pack)
+                    raise
         else:
-            # CPU pool: no streams to order; gather synchronously right here.
-            run0 = 0
-            while run0 < len(page_starts):
-                base = int(locs[page_starts[run0]])
-                run1 = run0 + 1
-                while (
-                    run1 < len(page_starts)
-                    and int(locs[page_starts[run1]])
-                    == base + (run1 - run0) * self.page_size
-                ):
-                    run1 += 1
-                payloads.extend(self.pool.gather_prefix_pages(
-                    locs[page_starts[run0]:page_starts[run1 - 1] + self.page_size]))
-                run0 = run1
+            # CPU pool: no streams to order; build the host payloads synchronously
+            # right here (build_gather_pages consumes a host ticket with no event
+            # wait, so the writer path is uniform). No in-flight window exists --
+            # the bytes are already copied by the time this returns.
+            for run_starts, run_locs in runs:
+                ticket = self.pool._plan_prefix_run(run_locs)
+                ticket["host"] = {tag: src.detach().cpu().clone()
+                                  for src, tag in ticket["slices"]}
+                built.append((run_starts, ticket))
         return {
             "ids": ids,
             "aligned": aligned,
             "matched": matched,
-            "page_starts": page_starts,
-            "payloads": payloads,
+            "runs": built,
+            "pin_bytes": pin_bytes,
             "generation": generation,
             "release": release,
             "t_issued": time.perf_counter(),
             "lock_ms": round(t_lock_ms, 1),
+            "locs_ms": round(locs_ms, 1),
             "issue_ms": round((time.perf_counter() - t_gather0) * 1e3, 1),
             "total_ms": round((time.perf_counter() - t0) * 1e3, 1),
         }
 
     def _complete_put(self, job: dict) -> int:
-        """Writer thread: the payloads were already gathered on the scheduler thread
-        (synchronous per-slice D2H, see _issue_put); this only does the tier-lock
-        insert. NO CUDA work here whatsoever -- any driver call or submission from
-        this thread risks the libcuda lock inversion against the engine thread."""
+        """Writer thread: wait each run's done event (wait-side; the copies were
+        already issued by the scheduler thread, see _issue_put), reassemble the
+        payloads from the pinned staging, then do the tier-lock insert. NO CUDA
+        submission here whatsoever -- any driver call or submission from this thread
+        risks the libcuda lock inversion against the engine thread. Packs the build
+        consumed (or never reached, on failure) are queued for the SCHEDULER to
+        recycle via _pack_recycle: freeing pinned memory here would touch the
+        caching host allocator, also a driver call."""
         result = 0
+        staged_ids: list[int] = []   # host pages staged but not yet index-linked
+        committed = False
         try:
             started = time.perf_counter()
             try:
-                t_done0 = time.perf_counter()
-                payloads: list[dict] = job["payloads"]
-                t_event_ms = (time.perf_counter() - t_done0) * 1e3
+                t_wait0 = time.perf_counter()
+                payloads: list[dict] = []
+                page_starts: list[int] = []
+                t_event_ms = 0.0  # build may raise before the first wait completes
+                for run_starts, ticket in job["runs"]:
+                    payloads.extend(self.pool.build_gather_pages(ticket))
+                    ticket["pack"] = None  # build_gather_pages queued it for recycle
+                    page_starts.extend(run_starts)
+                t_event_ms = (time.perf_counter() - t_wait0) * 1e3
                 ids = job["ids"]
                 aligned = job["aligned"]
                 # Phase 3 (tier lock): host bookkeeping + index insert. Re-match under
@@ -753,7 +897,7 @@ class DSV4PrefixTier:
                     )
                     t_ins0 = time.perf_counter()
                     new_rows: list[int] = []
-                    for start, payload in zip(job["page_starts"], payloads):
+                    for start, payload in zip(page_starts, payloads):
                         if start < tree_len:
                             continue  # an earlier put already inserted this page
                         end = start + self.page_size
@@ -761,6 +905,7 @@ class DSV4PrefixTier:
                         self._ensure_host_capacity(1, protect=len(new_rows) // self.page_size)
                         page_id = self._allocate_page_ids(1)[0]
                         self.host_pages[page_id] = payload
+                        staged_ids.append(page_id)
                         self.page_metadata[page_id] = {
                             "token_ids": ids[start:end].tolist(),
                             "parent_page_id": parent_page_id,
@@ -777,20 +922,30 @@ class DSV4PrefixTier:
                         ).handle.cached_len)
                     else:
                         result = tree_len
+                    committed = True
                 t_insert_ms = (time.perf_counter() - t_ins0) * 1e3
                 self._last_put_stages = {
                     "lock_ms": job["lock_ms"],
+                    "locs_ms": job["locs_ms"],
                     "gather_ms": job["issue_ms"],
                     "insert_ms": round(t_insert_ms, 1),
                 }
                 logger.info(
-                    "DSV4 HiCache put: pages=%d lock=%.0fms gather=%.0fms "
-                    "insert=%.0fms total=%.0fms",
-                    len(job["page_starts"]), job["lock_ms"], job["issue_ms"],
-                    t_insert_ms, job["total_ms"] + (time.perf_counter() - started) * 1e3,
+                    "DSV4 HiCache put: pages=%d lock=%.0fms locs=%.0fms gather=%.0fms "
+                    "event=%.0fms insert=%.0fms total=%.0fms",
+                    len(page_starts), job["lock_ms"], job["locs_ms"], job["issue_ms"],
+                    t_event_ms, t_insert_ms,
+                    job["total_ms"] + (time.perf_counter() - started) * 1e3,
                 )
                 return result
             finally:
+                # Queue any pack the loop above never consumed (generation early
+                # return, build failure) for the scheduler's recycle drain; built
+                # packs were already queued by build_gather_pages itself.
+                for _run_starts, ticket in job["runs"]:
+                    pack = ticket.get("pack")
+                    if pack is not None:
+                        self.pool._pack_recycle.append(pack)
                 self._record_latency("put", started)
                 stages = getattr(self, "_last_put_stages", {})
                 self._put_breakdown.append({
@@ -798,13 +953,24 @@ class DSV4PrefixTier:
                     "event_ms": round(t_event_ms, 1),
                     **stages,
                     "total_ms": round((time.perf_counter() - started) * 1e3, 1),
-                    "pages": len(job["page_starts"]),
+                    "pages": len(page_starts),
                 })
-        except Exception as exc:
-            logger.warning("DSV4 HiCache async put failed: %r", exc)
+        except Exception:
+            # Full traceback: an empty AssertionError() here cost a root-cause
+            # hunt (the bare asserts upstream carried no messages either).
+            logger.warning("DSV4 HiCache async put failed", exc_info=True)
+            if staged_ids and not committed:
+                # The insert loop died mid-way (e.g. "no evictable page"): pages
+                # already staged into host_pages are NOT in the index yet, so no
+                # eviction path can ever reach them -- drop them here or they
+                # permanently leak tier capacity.
+                with self._lock:
+                    for page_id in staged_ids:
+                        self._drop_page(page_id)
         finally:
             with self._lock:
                 self._pending_puts -= 1
+                self._pinned_inflight_bytes -= job["pin_bytes"]
             release = job["release"]
             if release is not None:
                 try:
@@ -895,7 +1061,10 @@ class DSV4PrefixTier:
         self.wait_puts()
         with self._lock:
             for future in list(self._prefetch_writes.values()):
-                future.result()
+                # A warm cancelled by _drop_page raises CancelledError on join;
+                # a cancelled warm is by definition finished work for this tier.
+                if not future.cancelled():
+                    future.result()
             self._prefetch_writes.clear()
             for future in list(self._disk_writes.values()):
                 future.result()
@@ -914,7 +1083,9 @@ class DSV4PrefixTier:
             futures = list(self._prefetch_writes.values())
             self._prefetch_writes.clear()
         for future in futures:
-            future.result()
+            # See flush(): a warm cancelled by _drop_page must not raise here.
+            if not future.cancelled():
+                future.result()
         # Host-resident pages are not crash-durable. On orderly shutdown, spill them too so
         # a restarted server can reconstruct the full disk-backed index. Pages already
         # spilled keep their (immutable) disk copy; rewriting them is pure waste.
@@ -1032,21 +1203,34 @@ class DSV4PrefixTier:
         if page_id in self.host_pages:
             self.host_pages.move_to_end(page_id)
 
-    def _warm_page(self, page_id: int) -> None:
+    def _warm_page(self, page_id: int, generation: int = -1, meta_ref: dict | None = None) -> None:
         try:
             # Load outside the lock: this is a full disk read, and holding the
             # tier lock across it would stall get()/put() on the only prefetch
             # worker's I/O.
             payload = self._load_page(page_id)
             with self._lock:
-                if self._closed or page_id in self.host_pages:
+                # Re-validate everything the load assumed. The page may have been
+                # evicted (evict -> _drop_page cancels this future but cannot stop
+                # an in-flight run), dropped with its id reallocated (metadata dict
+                # is a fresh object), or wiped by clear() (generation bumped). A
+                # stale insert would orphan the payload in host_pages or, worse,
+                # graft old KV onto a reused page id.
+                if (
+                    self._closed
+                    or page_id in self.host_pages
+                    or (generation >= 0 and self._generation != generation)
+                    or (meta_ref is not None and self.page_metadata.get(page_id) is not meta_ref)
+                ):
                     return
                 self._ensure_host_capacity(1)
                 self.host_pages[page_id] = payload
                 self._touch_page(page_id)
-        except Exception as exc:
+        except Exception:
             self.stats.prefetch_failures += 1
-            logger.warning("DSV4 HiCache prefetch failed for page %s: %r", page_id, exc)
+            logger.warning(
+                "DSV4 HiCache prefetch failed for page %s", page_id, exc_info=True
+            )
 
     def _page_has_window(self, page_id: int) -> bool:
         pending = self._disk_writes.get(page_id)
@@ -1174,10 +1358,18 @@ class DSV4PrefixTier:
         os.replace(metadata_tmp, metadata_path)
 
     def _load_page(self, page_id: int) -> dict:
-        pending = self._disk_writes.get(page_id)
+        # Lock only the fast dict ops; the file read below stays outside the lock.
+        # With >1 prefetch worker (FREETOKEN_PREFETCH_WORKERS) these dicts are
+        # also mutated by _drop_page/evict on other threads.
+        with self._lock:
+            pending = self._disk_writes.get(page_id)
         if pending is not None:
+            # Join outside the lock: the disk writer may be queued behind other
+            # writes, and holding the tier lock across the join would stall the
+            # scheduler thread.
             pending.result()
-            self._disk_writes.pop(page_id, None)
+            with self._lock:
+                self._disk_writes.pop(page_id, None)
         if page_id in self.host_pages:
             return self.host_pages[page_id]
         path = self.disk_pages.get(page_id)
@@ -1195,18 +1387,34 @@ class DSV4PrefixTier:
         expected = wrapper.get("checksum") or self.checksums.get(page_id)
         if actual != expected:
             raise RuntimeError("DSV4 HiCache payload checksum mismatch")
-        self.checksums[page_id] = actual
+        with self._lock:
+            self.checksums[page_id] = actual
         self.stats.disk_reads += 1
         return payload
 
     def _drop_page(self, page_id: int) -> None:
         self.host_pages.pop(page_id, None)
+        # Never join an in-flight or queued warm here: _drop_page runs under the
+        # tier lock, and a .result() could wait on a future that can never start
+        # (the only prefetch worker is the caller's own _warm_page, or the future
+        # is queued behind it) -- a pool-wide deadlock, reachable even with one
+        # worker via _warm_page -> _ensure_host_capacity -> evict -> here. Cancel
+        # instead: a queued warm never runs, and an in-flight one is invalidated
+        # by the generation/metadata re-check in _warm_page, so a dropped page
+        # cannot be resurrected by its own warm.
         prefetch = self._prefetch_writes.pop(page_id, None)
         if prefetch is not None:
-            prefetch.result()
+            prefetch.cancel()
         pending = self._disk_writes.pop(page_id, None)
         if pending is not None:
-            pending.result()
+            # Same rule as the warm above, minus the deadlock: the disk writer never
+            # takes the tier lock. CANCEL a queued write (the page and its files are
+            # being deleted -- writing then unlinking is pure waste, and joining a
+            # future queued behind the single worker is unbounded). An already
+            # RUNNING write cannot be cancelled and re-creates the path after our
+            # unlink if we don't wait, so join it: bounded by that one write.
+            if not pending.cancel():
+                pending.result()
         path = self.disk_pages.pop(page_id, None)
         if path is not None:
             path.unlink(missing_ok=True)

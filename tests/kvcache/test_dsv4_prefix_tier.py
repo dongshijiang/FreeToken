@@ -1,4 +1,5 @@
 import threading
+import time
 
 import pytest
 import torch
@@ -22,7 +23,7 @@ def _args():
     return args
 
 
-def _pool():
+def _pool(device: str = "cpu"):
     sizes = DSV4PoolSizes(
         P=P, swa_ratio=1.0, full_token=4 * P, n_win_slots=4 * P, n_win_pages=4,
         cmp_blocks=[None, 128, 4], idx_blocks=[None, 128, None],
@@ -30,7 +31,7 @@ def _pool():
         idx_state_slots=[None, 32, None],
     )
     pool = DSV4PagedKVCache(
-        sizes=sizes, args=_args(), device=torch.device("cpu"), dtype=torch.bfloat16,
+        sizes=sizes, args=_args(), device=torch.device(device), dtype=torch.bfloat16,
         P=P, n_scratch=1,
     )
     pool._init_paged_state(max_running_req=1, radix=True)
@@ -771,6 +772,76 @@ def test_cache_manager_async_put_pins_and_restores(tmp_path):
     assert tier.stats.restore_failures == 0
 
 
+def test_restore_quiesces_inflight_puts():
+    """Async puts make the host tier's contents rank-local, so a restore that reads the
+    tier while a writer is mid-put can fork the TP ranks' gloo call sequence (observed
+    as a 600s pair closure on 2xL20). _restore_dsv4_host_prefix must therefore wait for
+    in-flight puts before any tier read."""
+    import time
+    from types import SimpleNamespace
+
+    from freetoken.core import Req, SamplingParams
+    from freetoken.scheduler.cache import CacheManager
+
+    pool = _pool()
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=2)
+    pt = torch.zeros(4, 4 * P, dtype=torch.int32)
+    cm = CacheManager(
+        num_pages=4, page_size=P, page_table=pt, type="swa_radix",
+        swa_pool=pool, sliding_window_size=P, host_prefix_cache=tier,
+    )
+
+    ids = list(range(2000, 2000 + 2 * P + 1))
+    pending = SimpleNamespace(input_ids=torch.tensor(ids, dtype=torch.int32), input_len=len(ids))
+    handle = cm.match_req(pending).cuda_handle
+    req = Req(
+        input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=0, cached_len=0,
+        output_len=0, uid=0, sampling_params=SamplingParams(), cache_handle=handle,
+    )
+    req.device_len = len(ids)
+    cm.lock(handle)
+    cm.allocate_paged([req])
+    req.cached_len = len(ids)
+    with cm.lazy_free_region():
+        cm.cache_req(req, finished=False)
+    assert tier.pending_puts == 1
+
+    # Hold the writer mid-put so the put is provably in flight during the restore.
+    gate = threading.Event()
+    real_complete = tier._complete_put
+
+    def gated_complete(job):
+        gate.wait(timeout=30)
+        return real_complete(job)
+
+    tier._complete_put = gated_complete
+    waits = []
+    real_wait = tier.wait_puts
+
+    def counted_wait():
+        waits.append(1)
+        return real_wait()
+
+    tier.wait_puts = counted_wait
+
+    result = {}
+
+    def do_match():
+        result["handle"] = cm.match_req(pending).cuda_handle
+
+    th = threading.Thread(target=do_match)
+    th.start()
+    for _ in range(100):
+        if waits:
+            break
+        time.sleep(0.05)
+    assert waits == [1]  # the quiesce fired while the put was still in flight
+    gate.set()
+    th.join(timeout=30)
+    assert not th.is_alive()
+    assert tier.pending_puts == 0
+
+
 def test_match_prefix_full_returns_deepest_node():
     """match_prefix_full covers the whole key path (no swa windowed truncation) and
     node-aligns a partial match -- the boundary the async put pin relies on."""
@@ -1382,16 +1453,20 @@ def _pending(uid, base):
                       sampling_params=SamplingParams(max_tokens=4))
 
 
-def test_restore_gate_waits_then_admits_in_fifo_order():
+def test_restore_gate_waits_then_admits_in_fifo_order(monkeypatch):
+    from freetoken.scheduler import prefill as prefill_module
+
     fake = _FakeHostTier()
     fake.ready = {1000: False, 2000: True}
     _cm, pm = _build_bypass_managers(fake, num_pages=128)
     pm.pending_list = [_pending(1, 1000), _pending(2, 2000)]
 
-    # Head's pages are still warming: the gate blocks on the warm (rank-local,
-    # SPMD-safe) and then the pass admits in FIFO order. No scan-past -- a defer
-    # would let the TP ranks build different batches and deadlock the collectives
-    # (see the SPMD lockstep note in _try_allocate_one).
+    # Deferral disabled: A/B baseline pinning master's blocking behavior. The
+    # gate blocks on the warm (rank-local CPU wait) and the pass admits in FIFO
+    # order. (Deferral itself is safe since 2eac3cc MIN-votes the verdict --
+    # see test_restore_gate_defers_and_admits_later_ready_request; this test
+    # only pins the FREETOKEN_RESTORE_DEFER=0 fallback path.)
+    monkeypatch.setattr(prefill_module, "_RESTORE_DEFER", False)
     batch = pm.schedule_next_batch(128)
     assert [r.uid for r in batch.reqs] == [1, 2]
     assert fake.waited == [1000]  # only the not-ready head blocked
@@ -1468,3 +1543,523 @@ def test_host_release_drain_applies_only_ready_prefix():
     assert cm._host_release_applied == 2
     cm._drain_host_releases()  # idempotent once fully applied
     assert tree.unlocked == [("n0", 10), ("n1", 11)]
+
+
+def test_restore_gate_defers_and_admits_later_ready_request():
+    """Deferral (default): the not-ready head keeps its FIFO slot while a later,
+    already-warm candidate is admitted past it in the SAME pass -- sglang's
+    check_prefetch_progress-continue shape. No blocking wait may run."""
+    fake = _FakeHostTier()
+    fake.ready = {1000: False, 2000: True}
+    _cm, pm = _build_bypass_managers(fake, num_pages=128)
+    pm.pending_list = [_pending(1, 1000), _pending(2, 2000)]
+
+    batch = pm.schedule_next_batch(128)
+    assert [r.uid for r in batch.reqs] == [2]
+    assert fake.waited == []  # never blocked on the warming head
+    assert [(p.uid, p.defer_count) for p in pm.pending_list] == [(1, 1)]
+
+    # Warm lands: the deferred head is re-probed FIRST next pass and admits.
+    fake.ready[1000] = True
+    batch = pm.schedule_next_batch(128)
+    assert [r.uid for r in batch.reqs] == [1]
+    assert pm.pending_list == []
+
+
+def test_restore_gate_defer_cap_falls_back_to_blocking(monkeypatch):
+    """After _RESTORE_DEFER_MAX consecutive deferrals the request takes master's
+    blocking path (wait_restore + match_req) instead of deferring forever."""
+    from freetoken.scheduler import prefill as prefill_module
+
+    fake = _FakeHostTier()
+    fake.ready = {1000: False}
+    _cm, pm = _build_bypass_managers(fake, num_pages=128)
+    pm.pending_list = [_pending(1, 1000)]
+    monkeypatch.setattr(prefill_module, "_RESTORE_DEFER_MAX", 2)
+
+    assert pm.schedule_next_batch(128) is None  # defer #1
+    assert pm.schedule_next_batch(128) is None  # defer #2 (cap reached)
+    batch = pm.schedule_next_batch(128)  # cap hit -> blocking path admits
+    assert [r.uid for r in batch.reqs] == [1]
+    assert fake.waited == [1000]
+    assert pm.pending_list == []
+
+
+def test_all_deferred_pass_returns_none_keeps_pending():
+    """Every candidate still warming: the pass returns None, keeps the pending
+    order and the defer accounting, and leaves the cache structurally intact."""
+    fake = _FakeHostTier()
+    fake.ready = {1000: False, 2000: False}
+    cm, pm = _build_bypass_managers(fake, num_pages=128)
+    pm.pending_list = [_pending(1, 1000), _pending(2, 2000)]
+
+    assert pm.schedule_next_batch(128) is None
+    assert [(p.uid, p.defer_count) for p in pm.pending_list] == [(1, 1), (2, 1)]
+    assert fake.waited == []
+    cm.check_integrity()
+
+
+def test_deferred_warm_failure_admits_after_one_deferral():
+    """A warm that FAILS must not defer forever: done-but-failed counts as ready
+    (tier-level guarantee pinned by test_prefetch_ready_lets_failed_warm_reach_restore),
+    so the deferral lasts exactly one pass and the next one admits through the
+    synchronous restore path."""
+    fake = _FakeHostTier()
+    # First probe sees the warm in flight; the warm then fails (done-with-error,
+    # which prefetch_ready treats as ready) and the probe flips to ready.
+    fake.ready = {1000: False}
+    _cm, pm = _build_bypass_managers(fake, num_pages=128)
+    pm.pending_list = [_pending(1, 1000)]
+
+    assert pm.schedule_next_batch(128) is None  # warm in flight -> defer
+    fake.ready[1000] = True  # failed warm landed as done -> ready
+    batch = pm.schedule_next_batch(128)
+    assert [r.uid for r in batch.reqs] == [1]
+    assert fake.waited == []  # deferral path, not the blocking escape
+
+
+def test_both_ranks_defer_identically():
+    """SPMD contract: with rank-local readiness DISAGREEING per candidate, the
+    MIN-voted verdict must make both schedulers admit the same candidates and
+    defer the same ones with the same defer_count -- the unit-level twin of the
+    S2 cross-rank trace diff. A two-participant channel stands in for the gloo
+    all_reduce; each rank runs its pass on its own thread."""
+    from freetoken.scheduler.cache import CacheManager  # noqa: F401 (rig parity)
+
+    class _PairedMin:
+        """Two-participant MIN: the first caller parks its value and waits, the
+        second computes the min for both."""
+
+        def __init__(self):
+            self._cond = threading.Condition()
+            self._vals = []
+            self._result = None
+
+        def min(self, value):
+            with self._cond:
+                self._vals.append(value)
+                if len(self._vals) < 2:
+                    if not self._cond.wait(timeout=10):
+                        raise RuntimeError("paired MIN partner never arrived")
+                    return self._result
+                self._result = min(self._vals)
+                self._vals.clear()
+                self._cond.notify_all()
+                return self._result
+
+    chan = _PairedMin()
+    fake0, fake1 = _FakeHostTier(), _FakeHostTier()
+    # Deliberately disagree per candidate: MIN says uid1 and uid2 are ready on
+    # both ranks (either rank ready is enough), uid3 is not ready anywhere.
+    fake0.ready = {1000: False, 2000: True, 3000: False}
+    fake1.ready = {1000: True, 2000: False, 3000: False}
+    _cm0, pm0 = _build_bypass_managers(fake0, num_pages=128)
+    _cm1, pm1 = _build_bypass_managers(fake1, num_pages=128)
+    _cm0._tp_min = chan.min
+    _cm1._tp_min = chan.min
+    pm0.pending_list = [_pending(1, 1000), _pending(2, 2000), _pending(3, 3000)]
+    pm1.pending_list = [_pending(1, 1000), _pending(2, 2000), _pending(3, 3000)]
+
+    out = {}
+
+    def run(pm, key):
+        out[key] = pm.schedule_next_batch(128)
+
+    t0 = threading.Thread(target=run, args=(pm0, 0))
+    t1 = threading.Thread(target=run, args=(pm1, 1))
+    t0.start()
+    t1.start()
+    t0.join(timeout=10)
+    t1.join(timeout=10)
+    assert not t0.is_alive() and not t1.is_alive(), "paired MIN deadlocked"
+
+    assert [r.uid for r in out[0].reqs] == [1, 2]
+    assert [r.uid for r in out[1].reqs] == [1, 2]
+    d0 = [(p.uid, p.defer_count) for p in pm0.pending_list]
+    d1 = [(p.uid, p.defer_count) for p in pm1.pending_list]
+    assert d0 == [(3, 1)] == d1
+
+
+def test_prefetch_pool_workers_env(monkeypatch):
+    """FREETOKEN_PREFETCH_WORKERS sizes the warm pool; a multi-page cold prefix
+    still warms fully (reads are stateless, inserts serialize under the lock)."""
+    monkeypatch.setenv("FREETOKEN_PREFETCH_WORKERS", "2")
+    tier, ids = _seed_cold_tier(n_pages=2)
+    assert tier._prefetch_pool._max_workers == 2
+    monkeypatch.setattr(tier, "_load_page", _cold_payload)
+    assert tier.prefetch(ids, start=0) == 2
+    tier.wait_prefetch(ids)
+    assert all(tier.host_pages[pid] is not None for pid in range(2)) or len(tier.host_pages) == 2
+
+
+def test_drop_page_does_not_join_inflight_warm(monkeypatch):
+    """_drop_page must CANCEL an in-flight warm instead of joining it: the join
+    runs under the tier lock while the warm's own insert also needs that lock --
+    a lock-order inversion (and with a queued future behind the only worker, a
+    pool-wide deadlock). The dropped page must not be resurrected afterwards."""
+    tier, ids = _seed_cold_tier()
+    loaded = threading.Event()
+    release = threading.Event()
+
+    def gated_load(page_id):
+        loaded.set()
+        assert release.wait(timeout=10)
+        return _cold_payload(page_id)
+
+    monkeypatch.setattr(tier, "_load_page", gated_load)
+    tier.prefetch(ids[:P], start=0)
+    assert loaded.wait(timeout=10)
+    page_id = next(iter(tier._prefetch_writes))
+
+    import time as _time
+
+    t0 = _time.time()
+    tier._drop_page(page_id)  # old code: result() under the lock == deadlock
+    assert _time.time() - t0 < 5, "_drop_page joined the in-flight warm"
+    release.set()
+
+    # The in-flight warm finishes its load but must NOT insert the dropped page.
+    deadline = _time.time() + 2
+    while _time.time() < deadline and page_id in tier.host_pages:
+        _time.sleep(0.01)
+    assert page_id not in tier.host_pages
+
+
+def test_put_async_defers_completion_until_writer_runs(tmp_path):
+    """Deferred completion: put_async returns with the put still queued -- no pages
+    stored, no release invoked -- and everything lands only after the writer's
+    complete pass runs (the contract Stage 2's issue/complete split builds on)."""
+    pool = _pool()
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=4)
+    full = torch.arange(2 * P, dtype=torch.int32)
+    pool.alloc_swa(full)
+    ids = torch.arange(2 * P, dtype=torch.int32)
+
+    gate = threading.Event()
+    real_complete = tier._complete_put
+
+    def gated_complete(job):
+        gate.wait(timeout=30)
+        return real_complete(job)
+
+    tier._complete_put = gated_complete
+    releases: list = []
+    try:
+        assert tier.put_async(ids, full, release=lambda: releases.append(1)) == 2 * P
+        assert tier.pending_puts == 1
+        assert tier.host_pages_count == 0   # the writer has not run yet
+        assert releases == []               # release fires only after completion
+    finally:
+        gate.set()
+    tier.wait_puts()
+    assert tier.pending_puts == 0
+    assert tier.host_pages_count == 2
+    assert len(releases) == 1
+
+
+def test_put_build_failure_unwinds_accounting(tmp_path):
+    """A writer-side build failure is swallowed by _complete_put, but its finally must
+    still unwind pending_puts / the pinned-byte hold / the in-flight bases and invoke
+    the release exactly once (no byte or pin leaks on the fallback path)."""
+    pool = _pool()
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=4)
+    full = torch.arange(P, dtype=torch.int32)
+    pool.alloc_swa(full)
+    ids = torch.arange(P, dtype=torch.int32)
+
+    real_build = pool.build_gather_pages
+
+    def boom(ticket):
+        raise RuntimeError("build blew up")
+
+    pool.build_gather_pages = boom
+    releases: list = []
+    assert tier.put_async(ids, full, release=lambda: releases.append(1)) == P
+    tier.wait_puts()
+    assert len(releases) == 1
+    assert tier.host_pages_count == 0
+    with tier._lock:
+        assert tier._pending_puts == 0
+        assert tier._pinned_inflight_bytes == 0
+    pool.build_gather_pages = real_build
+
+
+def test_pin_budget_saturates_and_falls_back_to_sync(tmp_path):
+    """The pinned-byte budget is the second saturated leg; a saturated tier makes the
+    CacheManager eligibility vote refuse, so the put runs synchronously and no tree
+    pin is taken (the sync put never enters the seq/release queue)."""
+    from types import SimpleNamespace
+
+    from freetoken.core import Req, SamplingParams
+    from freetoken.scheduler.cache import CacheManager
+
+    pool = _pool()
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=4)
+    ids = list(range(1000, 1000 + 2 * P))
+    pt = torch.zeros(2, 4 * P, dtype=torch.int32)
+    cm = CacheManager(
+        num_pages=4, page_size=P, page_table=pt, type="swa_radix",
+        swa_pool=pool, sliding_window_size=P, host_prefix_cache=tier,
+    )
+
+    # Byte leg alone flips saturated.
+    assert not tier.saturated
+    tier._pinned_inflight_bytes = tier._pin_budget
+    assert tier.saturated
+
+    pending = SimpleNamespace(input_ids=torch.tensor(ids, dtype=torch.int32),
+                              input_len=len(ids))
+    handle = cm.match_req(pending).cuda_handle
+    req = Req(
+        input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=0, cached_len=0,
+        output_len=0, uid=0, sampling_params=SamplingParams(), cache_handle=handle,
+    )
+    req.device_len = len(ids)
+    cm.lock(handle)
+    cm.allocate_paged([req])
+    req.cached_len = len(ids)
+    seq_before = cm._host_put_seq
+    cm.cache_req(req, finished=False)
+    assert cm._host_put_seq == seq_before   # no pin taken: sync fallback
+    assert tier.pending_puts == 0           # the sync put already applied
+
+
+def test_tp_gate_and_unanimity_vote(tmp_path, monkeypatch):
+    """TP>1 keeps the synchronous put unless FREETOKEN_TP_ASYNC_PUT is set; with the
+    gate open the eligibility vote is unanimity (MAX): one refusing rank forces the
+    fallback before any pin is taken."""
+    from types import SimpleNamespace
+
+    from freetoken.core import Req, SamplingParams
+    from freetoken.scheduler.cache import CacheManager
+
+    pool = _pool()
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=4)
+    ids = list(range(1000, 1000 + P))
+    pt = torch.zeros(2, 4 * P, dtype=torch.int32)
+    cm = CacheManager(
+        num_pages=4, page_size=P, page_table=pt, type="swa_radix",
+        swa_pool=pool, sliding_window_size=P, host_prefix_cache=tier,
+    )
+
+    pending = SimpleNamespace(input_ids=torch.tensor(ids, dtype=torch.int32),
+                              input_len=len(ids))
+    handle = cm.match_req(pending).cuda_handle
+    req = Req(
+        input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=0, cached_len=0,
+        output_len=0, uid=0, sampling_params=SamplingParams(), cache_handle=handle,
+    )
+    req.device_len = len(ids)
+    cm.lock(handle)
+    cm.allocate_paged([req])
+    req.cached_len = len(ids)
+    cm._tp_size = 2
+
+    # Gate closed (default): the enqueue is never attempted, so no vote goes out.
+    votes: list = []
+    monkeypatch.setattr(cm, "_tp_max", lambda v: votes.append(v) or v)
+    cm.cache_req(req, finished=False)
+    assert votes == []
+    assert cm._host_put_seq == 0
+
+    # Gate open, peer refuses (MAX=1): fallback, still no pin.
+    monkeypatch.setenv("FREETOKEN_TP_ASYNC_PUT", "1")
+    monkeypatch.setattr(cm, "_tp_max", lambda v: 1)
+    cm.cache_req(req, finished=False)
+    assert cm._host_put_seq == 0
+
+    # Gate open, unanimous (MAX=0): the async path takes the pin.
+    monkeypatch.setattr(cm, "_tp_max", lambda v: v)
+    cm.cache_req(req, finished=False)
+    assert cm._host_put_seq == 1
+    tier.wait_puts()
+
+
+def test_free_swa_defers_pages_mid_gather(tmp_path):
+    """A page whose full base is a gather source of an unapplied put has its swa
+    slots parked instead of freed (the window allocator could reuse and rewrite
+    bytes the DMA is still reading); once the MIN-negotiated applied prefix passes
+    the put, the drain's flush releases exactly the parked slots. Both the park
+    test and the flush partition read the symmetric seq bookkeeping, never the
+    writer's progress."""
+    from freetoken.scheduler.cache import CacheManager
+
+    pool = _pool()
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=4)
+    pt = torch.zeros(2, 4 * P, dtype=torch.int32)
+    cm = CacheManager(
+        num_pages=4, page_size=P, page_table=pt, type="swa_radix",
+        swa_pool=pool, sliding_window_size=P, host_prefix_cache=tier,
+    )
+
+    full = torch.arange(P, 2 * P, dtype=torch.int32)   # page base P, off the 0 sentinel
+    pool.alloc_swa(full)
+    pt[0, :P] = full
+
+    # Put seq 0 is enqueued (counter=1) but not yet applied on both ranks; its
+    # gather reads the window slots of base P. The enqueue record and the
+    # counters are symmetric state, so this is what every rank evaluates.
+    cm._host_put_bases[0] = {P}
+    cm._host_put_seq = 1
+    cm._free_swa(pt[0, :P])
+    assert cm._deferred_swa_frees == full.tolist()      # parked, not freed
+    assert bool((pool.full_to_window[full.long()] >= 0).all())
+
+    # A page whose base is NOT a gather source frees directly, mid-put or not.
+    other = torch.arange(2 * P, 3 * P, dtype=torch.int32)
+    pool.alloc_swa(other)
+    pt[1, :P] = other
+    cm._free_swa(pt[1, :P])
+    assert cm._deferred_swa_frees == full.tolist()
+    assert bool((pool.full_to_window[other.long()] == -1).all())
+
+    # The drain applies the release on both ranks (applied=1) and prunes the
+    # base set; the flush then frees exactly the parked slots.
+    cm._host_release_applied = 1
+    cm._flush_deferred_swa_frees()
+    assert cm._deferred_swa_frees == []
+    assert bool((pool.full_to_window[full.long()] == -1).all())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_cuda_issue_build_pack_roundtrip(tmp_path):
+    """The real non-blocking path on CUDA: issue_prefix_copies stages per-slice
+    non_blocking D2H copies + one done event with NO sync; build_gather_pages waits
+    the event and reassembles identical payloads; drain_pack_recycle returns the
+    staging, and the tier's byte accounting pairs out to zero."""
+    pool = _pool(device="cuda")
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=4)
+    full = torch.arange(2 * P, dtype=torch.int32)
+    pool.alloc_swa(full)
+    win = pool.translate_full_to_window(full).long()
+    for layer in range(3):
+        pool.window_pool[layer][win] = torch.arange(
+            2 * P, dtype=torch.float32, device=pool._device
+        ).unsqueeze(1).to(torch.bfloat16) + 100 * layer
+
+    locs = full.to(torch.int64)
+    releases: list = []
+    assert tier.put_async(torch.arange(2 * P, dtype=torch.int32), locs,
+                          release=lambda: releases.append(1)) == 2 * P
+    tier.wait_puts()
+    assert len(releases) == 1
+    assert tier.host_pages_count == 2
+    with tier._lock:
+        assert tier._pinned_inflight_bytes == 0
+    assert pool._pack_recycle, "consumed packs wait for the scheduler drain"
+    tier.drain_put_recycles()
+    assert not pool._pack_recycle, "drain must return every pack to the free lists"
+    # The stored pages must carry the window values the copies staged.
+    payload = tier.host_pages[0]
+    assert torch.equal(payload["window"][0].cpu(),
+                       pool.window_pool[0][pool.translate_full_to_window(full[:P]).long()].cpu())
+
+
+def test_tier_readers_survive_concurrent_writes():
+    """Stress for the reader/writer race on the tier index: restorable_len /
+    match_len / window_page_positions used to run match_prefix + lock_handle
+    OUTSIDE the tier lock while the writer inserted (its tree walk can split_at
+    and truncate a node's key mid-read) and evicted (ref_count checks). The
+    writer here forces both hazards: every round regathers the same pool pages
+    under fresh token content (shared first page -> mid-node split_at) with
+    capacity == page count (eviction every put). Readers must never raise."""
+    pool = _pool()
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=3)
+    full = torch.arange(P, 4 * P, dtype=torch.int32)   # 3 pages off the sentinel
+    pool.alloc_swa(full)
+    win = pool.translate_full_to_window(full).long()
+    for layer in range(3):
+        pool.window_pool[layer][win] = (
+            torch.arange(3 * P, dtype=torch.bfloat16).unsqueeze(1) + 100 * layer
+        )
+    locs = full.to(torch.int64)
+
+    stop = threading.Event()
+    errors: list[Exception] = []
+
+    def writer():
+        try:
+            rnd = 0
+            while not stop.is_set():
+                rnd += 1
+                # Shared first page, fresh tail content: the writer's own walk must
+                # split the previous round's node mid-key before appending.
+                ids = torch.cat([
+                    torch.arange(P, dtype=torch.int32),
+                    torch.arange(2 * P, dtype=torch.int32) + 1000 + rnd,
+                ])
+                tier.put(ids, locs)
+        except Exception as exc:
+            errors.append(exc)
+
+    def reader():
+        try:
+            rnd = 0
+            while not stop.is_set():
+                rnd += 1
+                ids = torch.cat([
+                    torch.arange(P, dtype=torch.int32),
+                    torch.arange(2 * P, dtype=torch.int32) + 1000 + (rnd % 5),
+                ])
+                tier.match_len(ids)
+                tier.restorable_len(ids)
+                tier.window_page_positions(ids, 2 * P)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer), threading.Thread(target=reader),
+               threading.Thread(target=reader)]
+    for t in threads:
+        t.start()
+    time.sleep(2.0)
+    stop.set()
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "tier threads deadlocked"
+    assert not errors, f"reader/writer race surfaced: {errors!r}"
+
+
+def test_put_skips_when_tier_cannot_evict():
+    """The early doom check: with the host tier full of LOCKED prefixes (the P4
+    pressure shape -- running requests pin their pages, nothing is evictable), a
+    put that would need eviction is skipped at issue time: no gather, no writer
+    job, release fires exactly once, and the skip is counted. The same put on an
+    empty tier needs no eviction and must still land."""
+    pool = _pool()
+    tier = DSV4PrefixTier(pool, page_size=P, capacity_pages=3)
+    full = torch.arange(P, 4 * P, dtype=torch.int32)
+    pool.alloc_swa(full)
+    win = pool.translate_full_to_window(full).long()
+    for layer in range(3):
+        pool.window_pool[layer][win] = (
+            torch.arange(3 * P, dtype=torch.bfloat16).unsqueeze(1) + 100 * layer
+        )
+    locs = full.to(torch.int64)
+
+    # Empty tier: a 3-page put needs no eviction -> lands normally.
+    releases: list = []
+    got = tier.put_async(torch.arange(3 * P, dtype=torch.int32), locs,
+                         release=lambda: releases.append(1))
+    tier.wait_puts()
+    assert got == 3 * P
+    assert releases == [1]
+    assert tier.stats.put_skipped_capacity == 0
+    assert tier.host_pages_count == 3
+
+    # Lock the whole tree (every page in use), then a put with fresh content
+    # needs 3 evictions that cannot happen -> skipped before any gather.
+    # The index stores int64 keys, so direct index calls need int64 too.
+    ids = torch.arange(3 * P, dtype=torch.int64)
+    handle = tier.index.match_prefix(ids).cuda_handle
+    tier.index.lock_handle(handle)
+    puts_before = tier.stats.put_requests
+    releases2: list = []
+    got2 = tier.put_async(torch.arange(3 * P, dtype=torch.int32) + 50000, locs,
+                          release=lambda: releases2.append(1))
+    tier.wait_puts()
+    assert got2 == 0
+    assert releases2 == [1]
+    assert tier.stats.put_skipped_capacity == 1
+    assert tier.stats.put_requests == puts_before, "skipped put must not reach the writer"
+    assert tier.host_pages_count == 3
+    assert tier._pending_puts == 0

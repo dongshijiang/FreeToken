@@ -50,7 +50,9 @@ class RadixTreeNode:
         self._length: int
 
     def set_key_value(self, key: torch.Tensor, value: torch.Tensor) -> None:
-        assert len(key) == len(value)
+        assert len(key) == len(value), (
+            f"radix node key/value length mismatch: key={len(key)} value={len(value)}"
+        )
         self._key = key
         self._value = value
         self._length = len(key)
@@ -65,7 +67,7 @@ class RadixTreeNode:
 
     @property
     def parent(self) -> RadixTreeNode:
-        assert self._parent is not None
+        assert self._parent is not None, "radix node has no parent (root?)"
         return self._parent
 
     @property
@@ -85,7 +87,10 @@ class RadixTreeNode:
         return fast_compare_key(self._key, input_ids)
 
     def split_at(self, pos: int) -> RadixTreeNode:
-        assert 0 < pos < self.length
+        assert 0 < pos < self.length, (
+            f"radix split_at({pos}) out of range for node of length {self.length}; "
+            "a concurrent unlocked tree walk likely raced a writer's split"
+        )
         parent = self.parent
 
         new_node = RadixTreeNode(self.key_fn, self.timestamp)
@@ -146,7 +151,10 @@ class RadixPrefixCache(BasePrefixCache):
         if unlock:
             while not node.is_root():
                 node.ref_count -= 1
-                assert node.ref_count >= 0
+                assert node.ref_count >= 0, (
+                    "radix unlock drove a node's ref_count negative; the handle's "
+                    "node may have been evicted while the handle was outstanding"
+                )
                 if node.ref_count == 0:
                     self.evictable_size += node.length
                     self.protected_size -= node.length
@@ -192,7 +200,11 @@ class RadixPrefixCache(BasePrefixCache):
                 leave_nodes
             ), f"Cannot evict enough cache, need {size}, only {evicted_size} evicted"
             node = heapq.heappop(leave_nodes)
-            assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
+            assert node.ref_count == 0 and node.is_leaf() and not node.is_root(), (
+                f"radix evict picked a non-evictable node (ref_count={node.ref_count}, "
+                f"leaf={node.is_leaf()}); a ref_count may have been mutated outside "
+                "the tier lock (unlocked lock_handle racing evict)"
+            )
             evicted_size += node.length
             evicted_indices.append(node.value)
             self.evictable_size -= node.length

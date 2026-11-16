@@ -705,6 +705,36 @@ class DSV4PagedKVCache(BaseKVCachePool):
         ticket["pack"] = self._issue_pack(ticket["slices"])
         return ticket
 
+    def issue_prefix_copies(self, ticket: dict) -> dict:
+        """ISSUE half of the non-blocking gather: per-slice non_blocking D2H into a
+        per-job pinned staging, then one done event. NO sync, NO GPU->GPU packing
+        (that packed variant wedged the driver six times -- see gather_prefix_pages
+        and _issue_pack). Runs on the SCHEDULER thread inside the caller's gather
+        stream context, so ``done`` is recorded on the gather stream after every
+        copy; the writer thread later waits on it via build_gather_pages (wait-side
+        only). Returns the ticket with its "pack" set, ready for build_gather_pages.
+        """
+        slices = ticket["slices"]
+        ALIGN = 256  # keeps every byte offset element-alignable for .view(dtype)
+        plan: list[tuple[int, int, tuple, torch.dtype, str]] = []
+        off = 0
+        for src, tag in slices:
+            src = src.detach()
+            assert src.is_contiguous(), "gather slices are pool-buffer views"
+            nbytes = src.numel() * src.element_size()
+            plan.append((off, nbytes, tuple(src.shape), src.dtype, tag))
+            off += (nbytes + ALIGN - 1) // ALIGN * ALIGN
+        pinned = self._acquire_pinned(off)
+        stream = torch.cuda.current_stream(self._device)
+        for (off_i, nbytes, shape, dtype, _tag), (src, _) in zip(plan, slices):
+            dst = pinned[off_i:off_i + nbytes].view(dtype).view(shape)
+            dst.copy_(src, non_blocking=True)
+        done = self._acquire_event()
+        done.record(stream)
+        pack = {"plan": plan, "pinned": pinned, "done": done, "nbytes": off}
+        ticket["pack"] = pack
+        return ticket
+
     def build_gather_pages(self, ticket: dict) -> list[dict]:
         """COMPLETE half (writer thread): wait for the done event, reassemble the
         per-page payloads from the pinned pack, and queue the pack for the scheduler

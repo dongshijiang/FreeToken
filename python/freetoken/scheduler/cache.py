@@ -107,6 +107,22 @@ class CacheManager:
         self._host_put_seq = 0
         self._host_release_applied = 0
         self._host_releases: dict[int, tuple] = {}
+        # Per-put gather source bases (full-pool page bases), keyed by the same
+        # seq as _host_releases. Recorded at ENQUEUE time from the replicated
+        # page table, so both ranks hold identical sets under identical seqs;
+        # pruned as the MIN-negotiated applied prefix passes them. The union
+        # over [applied, seq) is the symmetric "mid-gather" set _free_swa parks
+        # against -- writer-paced state must never feed an admission-side
+        # decision (see _inflight_put_bases).
+        self._host_put_bases: dict[int, set] = {}
+        # SWA slots freed while their full-pool page is a gather source of a put
+        # that has not completed on BOTH ranks (the symmetric union in
+        # _free_swa). Freeing them inline would let the window allocator hand
+        # the slots out and rewrite bytes the DMA is still reading; the union
+        # being a pure function of the symmetric seq bookkeeping keeps the park
+        # and flush decisions identical on both ranks, so swa_available_size
+        # never goes rank-local mid-admission.
+        self._deferred_swa_frees: list[int] = []
 
     def _tp_world_size(self) -> int:
         """1 without TP sync, else the TP group's world size."""
@@ -138,6 +154,25 @@ class CacheManager:
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=group)
         return int(t.item())
 
+    def _tp_max(self, value: int) -> int:
+        """Largest ``value`` across the TP group; ``value`` unchanged without TP sync.
+
+        Used for UNANIMITY votes: every rank reports 0 when it is ready and 1 when
+        it must fall back, so the max is 0 only when every rank can proceed. (MIN
+        would let a single ready rank drag a saturated peer into the async path,
+        forking the pin/put state across ranks.) CPU gloo tensor only -- never
+        submits CUDA work."""
+        group = self.tp_cpu_group
+        if group is None or not (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group=group) > 1
+        ):
+            return value
+        t = torch.tensor([int(value)], dtype=torch.int64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=group)
+        return int(t.item())
+
     def _drain_host_releases(self) -> None:
         """Apply tree-pin releases for the async host puts both ranks have finished.
 
@@ -155,24 +190,88 @@ class CacheManager:
         stays asynchronous and rank-local -- only the accounting is synchronized.
         """
         applied = self._host_release_applied
-        if applied == self._host_put_seq:
-            return  # no pin outstanding -> nothing to negotiate (skip the allreduce)
-        ready = applied
-        while ready in self._host_releases:
-            ready += 1
-        ready = self._tp_min(ready)
-        while applied < ready:
-            tree, node, swa_uuid = self._host_releases.pop(applied)
-            applied += 1
-            try:
-                tree.dec_lock(node, swa_uuid)
-            except Exception as exc:
-                logger.warning("host put pin release failed: %r", exc)
-        self._host_release_applied = applied
+        if applied != self._host_put_seq:
+            ready = applied
+            while ready in self._host_releases:
+                ready += 1
+            ready = self._tp_min(ready)
+            while applied < ready:
+                tree, node, swa_uuid = self._host_releases.pop(applied)
+                applied += 1
+                try:
+                    tree.dec_lock(node, swa_uuid)
+                except Exception as exc:
+                    logger.warning("host put pin release failed: %r", exc)
+            self._host_release_applied = applied
+            # Symmetric pruning: every seq the applied prefix passed has completed
+            # on BOTH ranks -- drop its base set so the in-flight union below only
+            # spans [applied, seq).
+            for done_seq in [k for k in self._host_put_bases
+                             if k < self._host_release_applied]:
+                del self._host_put_bases[done_seq]
+        # Piggyback on the drain points (match_req + put path): return consumed
+        # gather packs to the pool's pinned/event free lists (scheduler-thread-only
+        # frees), then release the swa slots deferred while puts were in flight --
+        # the applied prefix above is exactly what makes the flush condition
+        # (applied == seq) symmetric across ranks.
+        host = self.host_prefix_cache
+        if host is not None and getattr(host, "supports_async", False):
+            host.drain_put_recycles()
+        self._flush_deferred_swa_frees()
+
+    def _inflight_put_bases(self) -> set:
+        """Union of the gather source bases of every enqueued-but-not-both-applied put.
+
+        A pure function of symmetric state -- the per-seq base sets recorded at
+        enqueue time from the replicated page table, plus the seq/applied counters
+        the drains advance identically -- so both ranks evaluate it identically at
+        the same scheduler points. Writer-paced state (the tier's own in-flight
+        tracking) must never feed an admission-side decision: it makes swa
+        availability rank-local and forks the schedulers (2xL20 pair deadlock)."""
+        union: set = set()
+        for seq in range(self._host_release_applied, self._host_put_seq):
+            union |= self._host_put_bases.get(seq, ())
+        return union
+
+    def _flush_deferred_swa_frees(self) -> None:
+        """Release parked swa slots whose gathering puts have completed on both ranks.
+
+        Runs on the scheduler thread at every release-drain point. The park test in
+        _free_swa and this partition both use _inflight_put_bases -- a pure function
+        of the symmetric seq bookkeeping -- so both ranks keep and free the same
+        slots at the same drains. (Splitting by writer progress, as an earlier
+        revision did via the tier's _inflight_full_bases, is rank-local: the fast
+        rank frees a slot its peer still holds parked, the admission gates read
+        different swa_available_size, and the schedulers fork -- observed on 2xL20,
+        one rank admitted a 3407-token request the peer refused, and the shifted
+        gloo sequences deadlocked the pair. Parking EVERYTHING while any put is
+        unapplied instead strangled the pool: 5376 slots went dark in one bench
+        round and the conservation assert fired.)
+        Parked slots always cover whole pages (free_swa is page-atomic), so
+        partial groups stay legal."""
+        if not self._deferred_swa_frees:
+            return
+        inflight = self._inflight_put_bases()
+        if not inflight:
+            done, self._deferred_swa_frees = self._deferred_swa_frees, []
+        else:
+            page = self.page_size
+            keep = [i for i in self._deferred_swa_frees
+                    if (i // page) * page in inflight]
+            done = [i for i in self._deferred_swa_frees
+                    if (i // page) * page not in inflight]
+            self._deferred_swa_frees = keep
+        if done and self.swa_pool is not None:
+            self.swa_pool.free_swa(torch.tensor(done, dtype=torch.int64))
 
     def _apply_all_host_releases(self) -> None:
         """Drain every LOCAL release without TP negotiation. Shutdown/rebuild only:
-        the peer's drains stop mattering there, and waiting on it could hang."""
+        the peer's drains stop mattering there, and waiting on it could hang.
+
+        DO NOT wire this (or flush_host_puts) into any steady-state path: applying
+        releases without the TP MIN negotiation makes available_size rank-local,
+        which is exactly the scheduler fork _drain_host_releases exists to prevent.
+        They stay shutdown-only by design."""
         while self._host_release_applied in self._host_releases:
             tree, node, swa_uuid = self._host_releases.pop(self._host_release_applied)
             self._host_release_applied += 1
@@ -220,8 +319,15 @@ class CacheManager:
         # Chunked prefill re-matches on every step; count the hit rate once per request,
         # at the first match, so later chunks matching their own prefill pages don't
         # inflate cached_tokens.
-        if self._host_releases:
-            self._drain_host_releases()
+        # UNCONDITIONAL drain: _host_releases fills at WRITER completion time, which
+        # is rank-local under async puts -- guarding this call on the dict let one
+        # rank run the drain's MIN while the peer skipped it, permanently shifting
+        # the two ranks' gloo sequences (observed on 2xL20: one rank parked in a
+        # restore _tp_min while the peer ran forwards; 600s pair closure). The
+        # applied/seq guard inside _drain_host_releases decides whether the MIN
+        # actually fires, and it is symmetric: the enqueue counter and the applied
+        # prefix both advance identically on every rank.
+        self._drain_host_releases()
         result = self._match_req(req)
         if getattr(req, "_kv_stat_counted", False) is False:
             req._kv_stat_counted = True
@@ -496,9 +602,33 @@ class CacheManager:
 
     def _free_swa(self, indices: torch.Tensor) -> None:
         """Free the swa-pool slots backing ``indices`` (full-pool slots). Idempotent over the
-        0 sentinel, so safe to call on any slots being returned to free_slots."""
-        if self.swa_pool is not None and len(indices) > 0:
-            self.swa_pool.free_swa(indices)
+        0 sentinel, so safe to call on any slots being returned to free_slots.
+
+        A page whose base is a gather source of a put that has not completed on BOTH
+        ranks is mid-DMA to the host tier: freeing its window slots now would let the
+        window allocator reuse and rewrite bytes the copy is still reading, so those
+        slots are parked and re-partitioned by _flush_deferred_swa_frees at every
+        drain. The park test uses _inflight_put_bases -- a pure function of the
+        symmetric seq bookkeeping (bases recorded at enqueue from the replicated page
+        table, pruned by the MIN-negotiated applied prefix) -- NOT of writer progress:
+        the writer-paced test an earlier revision used made the fast rank free slots
+        the slow rank still held parked, and the resulting swa_available_size
+        divergence forked the TP schedulers mid-admission (2xL20 pair deadlock)."""
+        if self.swa_pool is None or len(indices) == 0:
+            return
+        inflight = self._inflight_put_bases()
+        if inflight:
+            page = self.page_size
+            cpu = indices.detach().cpu().tolist()
+            parked = [i for i in cpu if (i // page) * page in inflight]
+            if parked:
+                self._deferred_swa_frees.extend(parked)
+                if len(parked) == len(cpu):
+                    return
+                indices = torch.tensor(
+                    [i for i in cpu if (i // page) * page not in inflight],
+                    dtype=torch.int64, device=indices.device)
+        self.swa_pool.free_swa(indices)
 
     def allocate_paged(self, reqs: List[Req]) -> None:
         needed_pages = 0
@@ -540,7 +670,13 @@ class CacheManager:
         """True when admitting this request cannot stall on a DSV4 host restore.
         Metadata-only; any probe error defaults to ready so admission never depends
         on the probe. Only the DSV4/SWA tier is gated: the plain-radix host path
-        (PrefixTier) has no prefetch futures to poll."""
+        (PrefixTier) has no prefetch futures to poll.
+
+        The MIN-reduced verdict gates admission DEFERRAL (FREETOKEN_RESTORE_DEFER,
+        prefill.py): a not-ready request keeps its FIFO slot and the scan moves on,
+        sglang's check_prefetch_progress-continue shape. Because the verdict is
+        rank-identical, both ranks defer and admit the same candidates in the same
+        order."""
         host = self.host_prefix_cache
         if host is None or not getattr(host, "supports_dsv4", False):
             return True
@@ -602,6 +738,26 @@ class CacheManager:
             return handle
         ids = req.input_ids[: req.input_len - 1]
         P = host.page_size
+        # Async puts make the host tier's contents rank-LOCAL: each rank's writer
+        # inserts pages at its own pace, so restorable_len / match_len /
+        # window_page_positions / get below can disagree across ranks -- and every
+        # early return between this function's collectives (the packed and restored
+        # MINs) then fires on one rank only, desynchronizing the two ranks' gloo
+        # call sequences (observed on 2xL20 with FREETOKEN_TP_ASYNC_PUT=1: one
+        # rank parked in _tp_min while the peer ran forwards; 600s pair closure).
+        # So quiesce the writers UNANIMOUSLY before any tier read: cheap when the
+        # writer keeps up (put events complete in ms), a bounded wait exactly when
+        # a restore is about to consume the tier. After the wait both ranks hold
+        # the same pages with the same metadata, the drain below has applied every
+        # release and flushed every deferred swa free (applied == seq once the
+        # writers are done), and available/swa capacity is rank-identical -- every
+        # local decision inside the collectives pairs again.
+        if self._tp_max(1 if host.pending_puts else 0) == 1:
+            try:
+                host.wait_puts()
+            except Exception as exc:
+                logger.warning("DSV4 host put quiesce failed: %r", exc)
+        self._drain_host_releases()
         try:
             target = min(host.restorable_len(ids), align_down(len(ids), P))
             # write_back shape: by GPU-eviction time the prefix's window KV has usually
@@ -784,9 +940,14 @@ class CacheManager:
             return torch.empty(0, dtype=torch.int32)
         return torch.cat(list(reversed(vals)))
 
-    def cache_req(self, req: Req, *, finished: bool) -> None:
+    def cache_req(self, req: Req, *, finished: bool,
+                  ready: "torch.cuda.Event | None" = None) -> None:
+        """Commit a request's prefix into the radix tree. ``ready`` (optional) is the
+        engine's commit-boundary event covering every KV write being cached -- the
+        DSV4 host-put gather waits on it instead of over-capturing the scheduler
+        stream's position."""
         if self.is_swa:
-            return self._cache_req_swa(req, finished=finished)
+            return self._cache_req_swa(req, finished=finished, ready=ready)
         if self.is_hybrid:
             return self._cache_req_hybrid(req, finished=finished)
         # ==================================== valid cache region ====================================
@@ -928,7 +1089,8 @@ class CacheManager:
             req.mamba_ping_pong = tuple(pp)
         req.mamba_last_track_seqlen = None
 
-    def _cache_req_swa(self, req: Req, *, finished: bool) -> None:
+    def _cache_req_swa(self, req: Req, *, finished: bool,
+                       ready: "torch.cuda.Event | None" = None) -> None:
         """SWA cache_req: commit the request's full KV prefix into the SWARadixCache (node.value =
         the canonical full-pool page indices; the swa KV rides along via the full->swa mapping).
         Tokens < req.swa_evicted_seqlen are marked tombstone on insert. No donate/COW (the swa KV
@@ -1001,16 +1163,20 @@ class CacheManager:
                 self.page_table[req.table_idx, : m.cached_len].copy_(m.kv_indices)
             req.cache_handle = SWACacheHandle(m.cached_len, m.node, m.kv_indices)
             self.lock(req.cache_handle)
-        self._put_dsv4_host_prefix(req, insert_len=insert_len)
+        self._put_dsv4_host_prefix(req, insert_len=insert_len, ready=ready)
 
-    def _put_dsv4_host_prefix(self, req: Req, *, insert_len: int) -> None:
+    def _put_dsv4_host_prefix(self, req: Req, *, insert_len: int,
+                              ready: "torch.cuda.Event | None" = None) -> None:
         """Write complete DSV4 pages to the dedicated HiCache tier after SWA commit.
 
         Async write-through: pin the committed tree path so the freshly inserted GPU
         slots stay un-evicted until the tier's writer gathers them, enqueue the put,
         and return immediately -- the writer drops the pin through the release queue
-        the scheduler drains. Falls back to a synchronous put when the writer is
-        saturated or the tree cannot be pinned at the full insert boundary.
+        the scheduler drains. ``ready`` is the engine's commit-boundary event
+        (copy_done) when the caller holds one, so the gather orders after exactly the
+        KV writes it covers. Falls back to a synchronous put when the writer is
+        saturated, the TP unanimity vote refuses, or the tree cannot be pinned at the
+        full insert boundary.
         """
         self._drain_host_releases()
         host = self.host_prefix_cache
@@ -1028,17 +1194,15 @@ class CacheManager:
             return
         try:
             if (
-                # TP keeps the synchronous put. The async pin's release timing is
-                # rank-local and, even with the seq/MIN drain below making the
-                # ACCOUNTING symmetric, any other stall longer than the gloo group
-                # timeout (60s default) makes a peer's MIN vote / broadcast time
-                # out and crash both ranks (observed on 2xL20 at 17:08:56: traces
-                # byte-identical, one rank stalled, the peer's collective threw).
-                # Fewer collective sites in TP = fewer pairing hazards; revisit with
-                # a raised --distributed-timeout before re-enabling.
+                # TP async put is gated OFF until re-validated end to end (the
+                # 2026-11-13 05:05 rc=137 run is attributed to the since-fixed
+                # _drop_page lock-join deadlock, and the gather no longer runs on
+                # the writer -- but the new issue-on-S/complete-on-W path with the
+                # deferred swa frees still needs the S2 repro legs and the 3-pass
+                # KV-pressure cell before the gate flips).
                 self._tp_size <= 1
-                and self._enqueue_async_host_put(req, insert_len)
-            ):
+                or os.environ.get("FREETOKEN_TP_ASYNC_PUT", "0") != "0"
+            ) and self._enqueue_async_host_put(req, insert_len, ready=ready):
                 return
             host.put(
                 req.input_ids[:insert_len],
@@ -1047,7 +1211,8 @@ class CacheManager:
         except Exception as exc:
             logger.warning("DSV4 host prefix write failed: %r", exc)
 
-    def _enqueue_async_host_put(self, req: Req, insert_len: int) -> bool:
+    def _enqueue_async_host_put(self, req: Req, insert_len: int,
+                                ready: "torch.cuda.Event | None" = None) -> bool:
         """Pin the just-committed SWA path and hand the put to the tier's writer thread.
 
         The pin (inc_lock node..root + trailing-window swa ref) keeps every source slot
@@ -1058,8 +1223,8 @@ class CacheManager:
         does not reach the full insert boundary, the writer is saturated, or the TP
         group voted the fallback. The async/sync choice itself must be rank-synchronized
         -- a pin held on one rank only is exactly the available_size fork the seq/MIN
-        release drain below exists to prevent -- so eligibility is MIN-voted across the
-        TP group before any pin is taken."""
+        release drain below exists to prevent -- so eligibility is MAX-voted (unanimity)
+        across the TP group before any pin is taken."""
         host = self.host_prefix_cache
         tree = self.prefix_cache
         node, matched = (
@@ -1073,11 +1238,20 @@ class CacheManager:
             and getattr(host, "supports_async", False)
             and not host.saturated
         )
-        if self._tp_min(0 if eligible else 1) != 0:
+        if self._tp_max(0 if eligible else 1) != 0:
             return False
         swa_uuid = tree.inc_lock(node)
         seq = self._host_put_seq
         self._host_put_seq += 1
+        # Record the gather's source bases under this put's seq (see
+        # _host_put_bases / _inflight_put_bases): the page table is replicated,
+        # so both ranks record the same set under the same seq, which is what
+        # makes the _free_swa park test symmetric.
+        page = self.page_size
+        committed = self.page_table[req.table_idx, :insert_len]
+        self._host_put_bases[seq] = {
+            int(b) for b in ((committed.detach().cpu() // page) * page).unique()
+        }
         released = False
 
         def release() -> None:
@@ -1088,15 +1262,17 @@ class CacheManager:
             self._host_releases[seq] = (tree, node, swa_uuid)
 
         try:
-            # Record the commit boundary on the engine stream: the tier's writer waits
-            # on this event (not the whole engine queue) before gathering the pools.
-            ready = None
-            if torch.cuda.is_available() and self.page_table.is_cuda:
+            if ready is None and torch.cuda.is_available() and self.page_table.is_cuda:
+                # No commit event from the caller: record on the CURRENT (scheduler)
+                # stream as a fallback. Note this over-captures whatever the
+                # scheduler stream last waited on (it can pin the position behind a
+                # whole engine forward via wait_stream) -- callers holding copy_done
+                # must pass it to avoid paying that.
                 ready = torch.cuda.Event()
                 ready.record()
             host.put_async(
                 req.input_ids[:insert_len],
-                self.page_table[req.table_idx, :insert_len].clone(),
+                committed.clone(),
                 release=release,
                 ready=ready,
             )
@@ -1173,11 +1349,14 @@ class CacheManager:
             tree_swa = pc.swa_evictable + pc.swa_protected
             cap = self.swa_pool.swa_num_tokens - 1  # slot 0 is the reserved sentinel
             # check_integrity is idle-only (like the exact full-pool check below), so no request
-            # holds a swa slot: free + tree must equal cap exactly. `==` (not `<=`) so a LEAK
-            # (free + tree < cap) is caught, not just a double-free (> cap).
-            assert self.swa_pool.swa_available_size() + tree_swa == cap, (
+            # holds a swa slot: free + tree + parked must equal cap exactly. Parked slots
+            # (_deferred_swa_frees) sit out the free list while their page is a gather
+            # source of an unapplied put; `==` (not `<=`) so a LEAK is caught, not just a
+            # double-free.
+            deferred = len(self._deferred_swa_frees)
+            assert self.swa_pool.swa_available_size() + tree_swa + deferred == cap, (
                 f"SWA-slot leak/double-free: free({self.swa_pool.swa_available_size()}) + "
-                f"tree({tree_swa}) != capacity({cap})"
+                f"tree({tree_swa}) + parked({deferred}) != capacity({cap})"
             )
         else:
             self.prefix_cache.check_integrity()
