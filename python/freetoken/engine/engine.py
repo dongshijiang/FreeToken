@@ -505,6 +505,11 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        # Seed the MoE LRU pool after the warmup reset (or a pristine cache when
+        # this backend skips the prefill warmup) so the first real request meets a
+        # warm cache instead of an empty one.
+        if self.moe_offload_cache is not None:
+            self.moe_offload_cache.preload_experts()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:

@@ -368,6 +368,9 @@ class OffloadMoELayer(MoELayer):
                 alphas=cache.alphas_for_layer(self.layer_id),
                 is_prefill=True,
             )
+            # Admit this layer's routed experts into the LRU pool before the buffer
+            # is released back to the prefetch choreography (see the cache method).
+            cache.promote_prefill_layer(self.layer_id, topk_ids)
             cache.release_prefill_layer(self.layer_id)
             return out
         cache.materialize_layer(self.layer_id)

@@ -25,6 +25,13 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
+# usage sentinel for the borrowed prefill-buffer slots during LRU admission. Those
+# slots hold streamed prefill bytes with no residency metadata (id_of_slot == -1),
+# so without this they look like the freshest free slots and admission would assign
+# experts into bytes the next prefetch overwrites. Above any real usage, below the
+# int64 packed-key shift overflow (usage << slot_bits must stay positive).
+_PROMOTE_USAGE_SENTINEL = 1 << 40
+
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -288,6 +295,24 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        # Active-set promotion + startup preload budgets, in experts per layer,
+        # against the per-layer share of the pool. Env overrides; < 0 / unset picks
+        # the default, 0 disables.
+        share = max(1, self.cache_size // self.num_layers)
+        promote_env = int(os.getenv("FREETOKEN_MOE_PROMOTE", "-1"))
+        preload_env = int(os.getenv("FREETOKEN_MOE_PRELOAD", "-1"))
+        self._promote_share = share if promote_env < 0 else promote_env
+        # Auto preload keeps half of the usable (non-buffer) pool free for the first
+        # prefill's active-set promotion; exceeding the usable pool would make the
+        # per-layer admission calls evict each other's slots (wasted PCIe copies).
+        self._preload_count = (
+            max(0, (self.cache_size - 2 * self.num_experts) // (2 * self.num_layers))
+            if preload_env < 0
+            else preload_env
+        )
+        # Per-chunk promotion budget, recomputed in begin_prefill from the live
+        # free-slot count; 0 = no admission this chunk.
+        self._promote_budget = 0
 
     def set_bank_sources(
         self,
@@ -664,6 +689,15 @@ class OffloadMoeCache:
             with torch.cuda.stream(self.prefill_copy_stream):
                 self._prefill_slot_snapshot.copy_(self.slot_for_id, non_blocking=True)
             self.prefill_copy_stream.synchronize()
+        self._promote_budget = 0
+        if self._promote_share > 0 and self.decode_target != "cpu":
+            # One host sync per chunk: admission is capped to the currently free
+            # share so it never evicts (every victim is a usage-0 slot), which in
+            # turn keeps the frozen hit/miss snapshot valid -- no slot it references
+            # is given away for the whole chunk.
+            assigned = int((self.id_of_slot >= 0).sum().item())
+            free = self.cache_size - 2 * self.num_experts - assigned
+            self._promote_budget = min(self._promote_share, max(0, free // self.num_layers))
 
     def prefetch_prefill_layer(self, layer_id: int) -> None:
         if not self.prefill_overlap or layer_id >= self.num_layers:
@@ -839,6 +873,112 @@ class OffloadMoeCache:
             self.prefill_release_events[buffer_id].record(torch.cuda.current_stream(self.device))
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
+
+    def promote_prefill_layer(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+        """Admit this layer's actually-routed experts from the prefill double buffer
+        into persistent LRU slots, so decode starts warm instead of cold.
+
+        Overlap prefill streams layers through borrowed slots (position == expert id,
+        routing unmapped) and never writes LRU metadata, so without this the first
+        decode step after every prefill fetches its whole active set over PCIe. The
+        per-chunk budget from ``begin_prefill`` guarantees free-slot-only admission:
+        victims are always usage-0 slots, never a resident, so the chunk's frozen
+        hit/miss snapshot stays valid and LRU history is untouched. The borrowed
+        buffer slots are usage-sentinel'd across the admission call only -- they look
+        free (id_of_slot == -1) and would otherwise win the argmin and hand pool
+        slots to bytes the next prefetch overwrites.
+
+        Called after the layer's GEMM, before ``release_prefill_layer``: the buffer
+        bytes are ready (the GEMM waited on them) and the release event orders the
+        next buffer reuse after the D2D copy below.
+        """
+        if self._promote_budget <= 0 or self.decode_target == "cpu":
+            return
+        if layer_id in self._unpinned_layers or self.is_cpu_layer(layer_id):
+            return
+        buffer_id = layer_id % 2
+        if self._prefill_buffer_layer[buffer_id] != layer_id:
+            return
+        num_experts = self.num_experts
+        # topk_ids are raw expert ids here (prefill routing passes through unmapped);
+        # the histogram picks the most-routed experts when the active set outgrows
+        # the budget, which a long prompt's routinely does.
+        hist = torch.bincount(topk_ids.reshape(-1).long(), minlength=num_experts)
+        m = min(self._promote_budget, num_experts)
+        ids = torch.topk(hist, m).indices.to(torch.int32)
+        buf_usage = self.usage[: 2 * num_experts]
+        buf_usage.fill_(_PROMOTE_USAGE_SENTINEL)
+        from freetoken.moe.offload_kernels import promote_experts
+
+        promote_experts(self, layer_id, ids)
+        buf_usage.zero_()
+        self._copy_missing_from_buffer(buffer_id)
+
+    def _copy_missing_from_buffer(self, buffer_id: int) -> None:
+        """D2D the staged misses from the double buffer into their new slots.
+
+        Same staged plan ``copy_missing`` consumes (evict_slots / src_indices /
+        num_indices from the admission call), but the rows are already on-device in
+        the borrowed buffer region: dst and src share the bank base pointers and
+        only the row indices differ (src row = borrowed slot of the expert), so this
+        is an intra-bank gather, not a PCIe fetch."""
+        if self._copy_fused_ok:
+            from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+            src_rows = self.src_indices + buffer_id * self.num_experts
+            # blocks_per_bank=64 like the hit gather: HBM D2D needs the wider grid.
+            fast_index_copy_multi_jit(
+                self._copy_dst_ptrs,
+                self._copy_dst_ptrs,
+                self._copy_feat_bytes,
+                self.evict_slots,
+                src_rows,
+                self.num_indices,
+                blocks_per_bank=64,
+            )
+            return
+        from freetoken.kernel import fast_index_copy_jit
+
+        for i, (_, cache) in enumerate(self.banks):
+            fast_index_copy_jit(
+                cache,
+                self.evict_slots,
+                self.prefill_bank_buffers[i][buffer_id],
+                self.src_indices,
+                self.num_indices,
+            )
+
+    def preload_experts(self) -> None:
+        """Startup seeding of the LRU pool: the first ``_preload_count`` expert ids
+        of every layer, admitted through the normal LRU machinery.
+
+        The first request then meets a warm cache instead of an empty one: the first
+        prefill's hit-D2D serves these rows device-side, and early decode steps hit
+        them. The auto default keeps half of the usable (non-buffer) pool for the
+        first prefill's active-set promotion. Preloaded experts carry normal LRU
+        usage, so real routing displaces them naturally. Runs after the warmup
+        reset (engine call site); one-time cost is one PCIe pass over the seeded
+        experts."""
+        if self.decode_target == "cpu" or not self.banks or self._preload_count <= 0:
+            return
+        from freetoken.moe.offload_kernels import promote_experts
+
+        m = min(self._preload_count, self.num_experts)
+        buf_usage = self.usage[: 2 * self.num_experts]
+        # Same borrowed-slot exclusion as promotion: a preload expert admitted into
+        # the buffer region would be revoked by the first prefill's invalidation.
+        buf_usage.fill_(_PROMOTE_USAGE_SENTINEL)
+        for layer_id in range(self.num_layers):
+            if layer_id in self._unpinned_layers or self.is_cpu_layer(layer_id):
+                continue
+            self._pending_src_layer = layer_id
+            self._pending_whole_layer = False
+            # fresh tensor per layer: admission rewrites the ids in place to slots
+            promote_experts(self, layer_id, torch.arange(m, dtype=torch.int32, device=self.device))
+            self.copy_missing()
+        buf_usage.zero_()
+        torch.cuda.synchronize(self.device)
+        logger.info(f"MoE cache preload: {m} experts per layer seeded into the LRU pool")
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts

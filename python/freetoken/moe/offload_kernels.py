@@ -40,6 +40,30 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     )
 
 
+def promote_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+    """Admit pre-selected experts into the LRU slot cache, off the decode counters.
+
+    Same flashlib admission as :func:`ensure_experts` but with ``stats=None`` and no
+    decode-frequency scatter: the callers (active-set promotion, startup preload) run
+    during prefill/startup, and their routes would pollute the per-step miss-rate and
+    routing-histogram reports. The caller is responsible for keeping victims out of
+    the borrowed prefill-buffer slots (usage sentinel) and for moving the bytes.
+    """
+    lru_ensure(
+        expert_ids,
+        cache.slot_for_id.view(-1),
+        cache.id_of_slot,
+        cache.usage,
+        cache.step,
+        expert_ids,
+        cache.src_indices,
+        cache.evict_slots,
+        cache.num_indices,
+        stats=None,
+        id_base=layer_id * cache.num_experts,
+    )
+
+
 def ensure_experts_hybrid(
     cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0
 ) -> None:
