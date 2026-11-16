@@ -795,8 +795,17 @@ def parse_args(
             "During prefill prefetch, copy cache-resident experts device-side into "
             "the double buffer and stream only the misses over PCIe "
             "(cudaMemcpyBatchAsync, CUDA >= 13.0). Effective with "
-            "--moe-cache-size > 2 * num_experts."
+            "--moe-cache-size > 2 * num_experts. Enabled by default; the probe "
+            "falls back to full-layer copies when the batch API is unavailable."
         ),
+    )
+
+    parser.add_argument(
+        "--disable-moe-prefill-hit-d2d",
+        action="store_false",
+        dest="moe_prefill_hit_d2d",
+        default=ServerArgs.moe_prefill_hit_d2d,
+        help="Disable the prefill hit-D2D split (see --moe-prefill-hit-d2d).",
     )
 
     parser.add_argument(
