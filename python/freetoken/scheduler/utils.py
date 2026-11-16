@@ -20,6 +20,10 @@ class PendingReq:
     mm_items: list | None = None
     mrope_positions_full: torch.Tensor | None = None
     mrope_delta: int = 0
+    # Admission-deferral bookkeeping: how many passes this request was soft-skipped
+    # because its DSV4 host pages were still warming. Incremented only on the
+    # MIN-voted not-ready verdict, so it is identical on every TP rank.
+    defer_count: int = 0
 
     @property
     def input_len(self) -> int:

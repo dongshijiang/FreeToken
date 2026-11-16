@@ -49,6 +49,26 @@ _KV_OUTPUT_RESERVE = int(os.environ.get("FREETOKEN_KV_OUTPUT_RESERVE", "0") or 0
 # the (usually no-op) wait. (Tests patch the module global directly.)
 _RESTORE_BYPASS = os.environ.get("FREETOKEN_RESTORE_BYPASS", "1") != "0"
 
+# FREETOKEN_RESTORE_DEFER=1 (default): a not-ready probe verdict (MIN-voted, so
+# rank-identical -- see restore_ready) soft-defers the request instead of blocking:
+# it keeps its FIFO slot and the scan continues with later candidates, sglang-style.
+# The verdict can only say "defer" while BOTH ranks' warms are in flight, so the
+# deferred window ends as soon as either rank's warm lands. 0 restores master's
+# blocking behavior (probe + in-place wait_restore) for A/B.
+_RESTORE_DEFER = os.environ.get("FREETOKEN_RESTORE_DEFER", "1") != "0"
+
+# Escape hatch against a deferral ping-pong (warmed pages evicted from the host
+# LRU before admission -> rekick -> re-defer): after this many consecutive
+# deferrals the request falls back to master's blocking path. Both ranks reach
+# the cap on the same pass because defer_count only grows on the shared verdict.
+_RESTORE_DEFER_MAX = int(os.environ.get("FREETOKEN_RESTORE_DEFER_MAX", "100") or 100)
+
+# CPU backoff for a pass that admitted nothing because every candidate deferred:
+# without it the scheduler loop spins at full speed, re-entering one gloo
+# all_reduce per deferred candidate per pass. Sleeping is rank-local timing only
+# -- it changes WHEN each rank enters the next collective, never the ORDER.
+_DEFER_POLL_SECONDS = 0.002
+
 
 def _trace_rank() -> int:
     """TP rank for trace attribution. os.environ["RANK"] is unset in spawn workers,
@@ -58,7 +78,7 @@ def _trace_rank() -> int:
     return ti.rank if ti is not None else -1
 
 
-def _trace_schedule(mgr, adder, reqs, failed_uid) -> None:
+def _trace_schedule(mgr, adder, reqs, failed_uid, deferred=()) -> None:
     global _trace_fh
     if _trace_fh is None:
         _trace_fh = open(f"/tmp/sched_trace_r{_trace_rank()}.jsonl", "a", buffering=1)
@@ -84,6 +104,10 @@ def _trace_schedule(mgr, adder, reqs, failed_uid) -> None:
         "swa_avail": getattr(cm, "swa_available_size", None),
         "gdn_free": pool.num_free_slots if pool is not None else None,
         "pending": [p.uid for p in mgr.pending_list],
+        # (uid, defer_count) pairs for requests soft-skipped on the MIN-voted
+        # restore verdict this pass. Both ranks must produce the same sequence
+        # -- diffing it across ranks is part of the S2 wedge gate.
+        "deferred": list(deferred),
     }
     _trace_fh.write(json.dumps(rec) + "\n")
 
@@ -154,20 +178,25 @@ class PrefillAdder:
             self.last_fail = "table_exhausted"
             return None
 
-        # Restore gate: a request whose DSV4 host pages are still warming would
-        # block the admission loop inside match_req. Probe first (metadata only)
-        # to re-kick missing warms, then wait out-of-line so the stall is visible
-        # and counted before match_req repeats the (now no-op) wait.
-        # SPMD lockstep: the probe verdict is rank-local (each rank's tier warms
-        # on its own disk timeline), so deferring the request here would build
-        # different batches per rank -- the admitting peer would launch NCCL
-        # collectives this rank never matches while this rank's next receive
-        # needs the peer's gloo broadcast: ABBA deadlock (repro'd on 2xL20:
-        # forward stuck in MoE copy-stream sync, AllReduce spinning on GPU0).
-        # Blocking instead keeps every rank's batch the same FIFO prefix; warm
-        # latency may differ per rank but readiness is monotone, so collectives
-        # pair up once the slower rank catches up. CPU-only wait, no CUDA submit.
+        # Restore gate: probe first (metadata only) so a request whose DSV4 host
+        # pages are still warming does not stall the admission loop inside match_req.
+        # (History: 5796366 blocked here because an earlier deferral used a
+        # rank-local verdict and forked the batches -> ABBA deadlock on 2xL20.
+        # Since 2eac3cc restore_ready MIN-reduces the verdict -- ready if ANY rank
+        # is ready -- so deferral keeps batch composition identical; the
+        # rank-local verdict no longer exists. Blocking remains as the
+        # deferral-cap escape below.)
         if _RESTORE_BYPASS and not self.cache_manager.restore_ready(req):
+            if _RESTORE_DEFER and req.defer_count < _RESTORE_DEFER_MAX:
+                # Soft failure: keep the FIFO slot, let the scan continue with
+                # later candidates. Nothing was touched -- the probe is
+                # metadata-only and match_req never ran, so there is nothing to
+                # unlock or free on this path.
+                self.last_fail = "restore_pending"
+                return None
+            # Cap reached (or deferral off): master's blocking path. Rank-local
+            # CPU wait on the prefetch futures; the probe already re-kicked any
+            # missing warm. match_req below repeats the (now no-op) wait.
             self.cache_manager.wait_restore(req)
         mr = self.cache_manager.match_req(req)
         handle = mr.cuda_handle
@@ -436,6 +465,7 @@ class PrefillManager:
         log_new_tokens = 0
         log_cached_tokens = 0
         failed_uid = None
+        deferred: List[Tuple[int, int]] = []  # (uid, defer_count) for the trace
         for idx, pending_req in enumerate(self.pending_list):
             is_continuation = pending_req.chunked_req is not None
             adder.last_fail = ""
@@ -461,12 +491,25 @@ class PrefillManager:
                 log_new_tokens += req.extend_len
                 if not is_continuation:
                     log_cached_tokens += req.cache_handle.cached_len
+            elif adder.last_fail == "restore_pending" and not is_continuation:
+                # Soft failure: this candidate's host pages are still warming.
+                # Keep its FIFO slot and keep scanning -- later, ready candidates
+                # may be admitted past it this pass. The head is re-probed FIRST
+                # next pass, so it can never be starved by later admissions.
+                pending_req.defer_count += 1
+                deferred.append((pending_req.uid, pending_req.defer_count))
+                kept.append(pending_req)
+                continue
             else:
                 failed_uid = (pending_req.uid, adder.last_fail or "unknown")
                 kept.extend(self.pending_list[idx:])  # hard failure: keep this one + tail verbatim
                 break  # We cannot add more requests
+        if not reqs and deferred:
+            # Every candidate this pass was still warming: back off so the idle
+            # loop does not busy-poll the readiness votes (see _DEFER_POLL_SECONDS).
+            time.sleep(_DEFER_POLL_SECONDS)
         if _SCHED_TRACE:
-            _trace_schedule(self, adder, reqs, failed_uid)
+            _trace_schedule(self, adder, reqs, failed_uid, deferred)
         if len(reqs) == 0:
             return None
         self.pending_list = chunked_list + kept
