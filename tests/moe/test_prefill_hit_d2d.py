@@ -60,6 +60,21 @@ def _seed_resident(cache, sources, layer_id: int, expert_id: int, slot: int) -> 
 @CUDA
 @JIT
 @BATCH_API
+def test_batch_memcpy_probe_survives_queue_pressure():
+    # The probe's zeros fill runs on the current stream while its copy runs on a
+    # non-blocking side stream; under a deep queue (the real call site is mid-warmup)
+    # the fill used to land after the copy and the probe read zeros back, disabling
+    # hit-D2D on every server start. The probe must order the fill first.
+    from freetoken.kernel.batch_memcpy import _probe, load_batch_memcpy
+
+    fn = load_batch_memcpy()
+    torch.cuda._sleep(int(2e9))  # back up the current stream ~1s of GPU spin
+    _probe(fn)  # used to raise "cudaMemcpyBatchAsync probe copied wrong bytes"
+
+
+@CUDA
+@JIT
+@BATCH_API
 def test_batch_memcpy_roundtrip():
     from freetoken.kernel.batch_memcpy import batch_memcpy_jit
 

@@ -28,6 +28,11 @@ def _probe(fn) -> None:
     src = torch.arange(16, dtype=torch.uint8).pin_memory()
     dst = torch.zeros(16, dtype=torch.uint8, device="cuda")
     stream = torch.cuda.Stream()
+    # torch streams are non-blocking, so the zeros fill on the current stream does not
+    # order against the memcpy below. At the real call site (mid-warmup, GPU queue deep)
+    # the copy then lands BEFORE the fill and the check reads back zeros -- the
+    # "copied wrong bytes" that disabled hit-D2D on every server start. Order them.
+    stream.wait_stream(torch.cuda.current_stream())
     fn(
         torch.tensor([dst.data_ptr()]),
         torch.tensor([src.data_ptr()]),
