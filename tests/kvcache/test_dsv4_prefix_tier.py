@@ -1825,9 +1825,9 @@ def test_pin_budget_saturates_and_falls_back_to_sync(tmp_path):
 
 
 def test_tp_gate_and_unanimity_vote(tmp_path, monkeypatch):
-    """TP>1 keeps the synchronous put unless FREETOKEN_TP_ASYNC_PUT is set; with the
-    gate open the eligibility vote is unanimity (MAX): one refusing rank forces the
-    fallback before any pin is taken."""
+    """TP>1 defaults to the async put; FREETOKEN_TP_ASYNC_PUT=0 falls back to the
+    synchronous put. With the gate open the eligibility vote is unanimity (MAX):
+    one refusing rank forces the fallback before any pin is taken."""
     from types import SimpleNamespace
 
     from freetoken.core import Req, SamplingParams
@@ -1855,14 +1855,16 @@ def test_tp_gate_and_unanimity_vote(tmp_path, monkeypatch):
     req.cached_len = len(ids)
     cm._tp_size = 2
 
-    # Gate closed (default): the enqueue is never attempted, so no vote goes out.
+    # Gate closed (opt-out via FREETOKEN_TP_ASYNC_PUT=0): the enqueue is never
+    # attempted, so no vote goes out.
     votes: list = []
+    monkeypatch.setenv("FREETOKEN_TP_ASYNC_PUT", "0")
     monkeypatch.setattr(cm, "_tp_max", lambda v: votes.append(v) or v)
     cm.cache_req(req, finished=False)
     assert votes == []
     assert cm._host_put_seq == 0
 
-    # Gate open, peer refuses (MAX=1): fallback, still no pin.
+    # Gate open (default), peer refuses (MAX=1): fallback, still no pin.
     monkeypatch.setenv("FREETOKEN_TP_ASYNC_PUT", "1")
     monkeypatch.setattr(cm, "_tp_max", lambda v: 1)
     cm.cache_req(req, finished=False)

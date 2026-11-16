@@ -1194,14 +1194,14 @@ class CacheManager:
             return
         try:
             if (
-                # TP async put is gated OFF until re-validated end to end (the
-                # 2026-11-13 05:05 rc=137 run is attributed to the since-fixed
-                # _drop_page lock-join deadlock, and the gather no longer runs on
-                # the writer -- but the new issue-on-S/complete-on-W path with the
-                # deferred swa frees still needs the S2 repro legs and the 3-pass
-                # KV-pressure cell before the gate flips).
+                # TP async put is the default: validated end to end on 2xL20 TP2
+                # (three-gate pressure chain rc=0, sync-vs-async matrices with
+                # equal hit rates, -13% TTFT under high concurrency). The
+                # 2026-11-13 05:05 rc=137 was attributed to the since-fixed
+                # _drop_page lock-join deadlock. FREETOKEN_TP_ASYNC_PUT=0 falls
+                # back to the inline sync put.
                 self._tp_size <= 1
-                or os.environ.get("FREETOKEN_TP_ASYNC_PUT", "0") != "0"
+                or os.environ.get("FREETOKEN_TP_ASYNC_PUT", "1") != "0"
             ) and self._enqueue_async_host_put(req, insert_len, ready=ready):
                 return
             host.put(
