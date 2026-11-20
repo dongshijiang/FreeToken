@@ -228,6 +228,7 @@ def tokenize_worker(
                         hicache=msg.hicache,
                         kv_cache=msg.kv_cache,
                         decode_stage=msg.decode_stage,
+                        moe_cache=msg.moe_cache,
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]

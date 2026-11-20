@@ -120,6 +120,9 @@ class Scheduler(SchedulerIOMixin):
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
+        # TTL-throttled /v1/stats snapshot of the MoE expert cache (see _moe_cache_snapshot).
+        self._moe_cache_stats: dict | None = None
+        self._moe_cache_stats_at: float = 0.0
         # Abort acknowledgements are a terminal accounting barrier. Queue them while processing
         # inbound control messages, then flush only AFTER _process_last_data publishes any
         # sampled replies from the prior overlapped forward.
@@ -558,9 +561,11 @@ class Scheduler(SchedulerIOMixin):
                     except Exception as exc:
                         logger.warning("could not snapshot host prefix cache: %r", exc)
                 # Test fakes stub the scheduler as a bare SimpleNamespace; the TPOT stage
-                # breakdown only exists on the real engine loop.
+                # breakdown and the moe snapshot helper only exist on the real scheduler.
                 if hasattr(self, "_stage_snapshot"):
                     m.decode_stage = self._stage_snapshot()
+                if hasattr(self, "_moe_cache_snapshot"):
+                    m.moe_cache = self._moe_cache_snapshot(force=bool(new_finished_reqs))
         engine = getattr(self, "engine", None)
         moe_cache = getattr(engine, "moe_offload_cache", None)
         self.status_reporter.report_batch(
@@ -572,9 +577,27 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
-            moe_stats=self._moe_status if moe_cache is not None and moe_cache.collect_stats else None,
+            moe_stats=self._moe_status() if moe_cache is not None and moe_cache.collect_stats else None,
         )
         self.send_result(reply)
+
+    def _moe_cache_snapshot(self, force: bool = False) -> dict | None:
+        """Expert-cache counters for /v1/stats, mirroring m.hicache. None when the
+        offload cache is absent or ``--moe-collect-stats`` is off. decode_miss_stats
+        reads device tensors (a GPU sync), so snapshots are TTL-throttled; batches
+        that finished requests force a refresh so the post-leg snapshot is current."""
+        cache = getattr(self.engine, "moe_offload_cache", None)
+        if cache is None or not cache.collect_stats:
+            return None
+        now = time.monotonic()
+        if not force and self._moe_cache_stats is not None and now - self._moe_cache_stats_at < 1.0:
+            return self._moe_cache_stats
+        stats = cache.decode_miss_stats()
+        stats["hit_rate"] = 1.0 - stats["miss_rate"]
+        stats["strategy"] = cache.decode_target
+        self._moe_cache_stats = stats
+        self._moe_cache_stats_at = now
+        return stats
 
     def _moe_status(self) -> str:
         """One throttled decode-log line of expert cache behavior. The stats read does a

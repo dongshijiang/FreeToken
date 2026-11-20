@@ -55,6 +55,9 @@ class DetokenizeMsg(BaseTokenizerMsg):
     # Decode-step stage timing (cumulative totals in ms + iteration count over decode-only
     # steps); None when not reported. Diffed across /v1/stats snapshots to attribute TPOT.
     decode_stage: Dict[str, float] | None = None
+    # MoE expert-cache counters (miss/hit/fetch rates, strategy); None when the offload
+    # cache is absent or --moe-collect-stats is off.
+    moe_cache: Dict[str, Any] | None = None
 
 
 @dataclass

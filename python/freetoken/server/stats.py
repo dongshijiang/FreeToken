@@ -40,6 +40,7 @@ class StatsTracker:
         self.hicache: dict[str, int] | None = None
         self.kv_cache: dict[str, int] | None = None
         self.decode_stage: dict[str, float] | None = None
+        self.moe_cache: dict[str, Any] | None = None
 
     @property
     def active(self) -> int:
@@ -86,6 +87,9 @@ class StatsTracker:
         decode_stage = getattr(reply, "decode_stage", None)
         if decode_stage is not None:
             self.decode_stage = dict(decode_stage)
+        moe_cache = getattr(reply, "moe_cache", None)
+        if moe_cache is not None:
+            self.moe_cache = dict(moe_cache)
         if getattr(reply, "finished", False):
             uid = getattr(reply, "uid", None)
             if uid in self._inflight:
@@ -177,6 +181,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "hicache": tr.hicache,
         "kv_cache": tr.kv_cache,
         "decode_stage": tr.decode_stage,
+        "moe_cache": tr.moe_cache,
         "gpus": list(getattr(state, "gpus", None) or []),
         "throughput": {
             "decode_tps": round(tr.decode_tps(), 1),

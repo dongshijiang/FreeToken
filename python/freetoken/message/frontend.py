@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from .utils import deserialize_type, serialize_type
 
@@ -51,6 +51,8 @@ class UserReply(BaseFrontendMsg):
     kv_cache: Dict[str, int] | None = None
     # Decode-step stage timing totals (ms) over decode-only steps; None when not reported.
     decode_stage: Dict[str, float] | None = None
+    # MoE expert-cache counters (miss/hit/fetch rates, strategy); None when not reported.
+    moe_cache: Dict[str, Any] | None = None
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would
