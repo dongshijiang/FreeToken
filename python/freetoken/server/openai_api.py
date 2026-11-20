@@ -246,13 +246,6 @@ async def stream_chat_completion_chunks(
     """Format generate_events() into the OpenAI chat.completion.chunk SSE stream."""
     if spec is None:
         spec = chat_request_to_genspec(req, {})
-    yield _sse(
-        _chat_chunk(
-            req,
-            uid,
-            [{"delta": {"role": "assistant", "content": ""}, "index": 0, "finish_reason": None}],
-        )
-    )
 
     prompt_tokens = 0
     completion_tokens = 0
@@ -260,6 +253,11 @@ async def stream_chat_completion_chunks(
     tool_calls_sent = 0
     open_tool: dict[str, Any] | None = None
     events = generate_events(uid, spec, state, source="/v1/chat/completions")
+    # OpenAI-style role prelude. Emitted with the first engine event, not at stream
+    # open: nothing goes on the wire until the first token, so the first choices
+    # chunk (and thus client-measured TTFT) lands at first-token time, matching
+    # sglang/vLLM. Streams that fail before the first token carry no prelude.
+    role_sent = False
     while True:
         try:
             ev = await events.__anext__()
@@ -272,6 +270,15 @@ async def stream_chat_completion_chunks(
                 {"error": {"message": str(exc), "type": "invalid_request_error", "code": exc.code}}
             )
             break
+        if not role_sent:
+            role_sent = True
+            yield _sse(
+                _chat_chunk(
+                    req,
+                    uid,
+                    [{"delta": {"role": "assistant", "content": ""}, "index": 0, "finish_reason": None}],
+                )
+            )
         if isinstance(ev, ReasoningDelta):
             yield _sse(
                 _chat_chunk(

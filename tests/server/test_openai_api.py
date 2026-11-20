@@ -319,6 +319,19 @@ def test_stream_chat_completion_emits_chat_chunks_tool_delta_and_done():
     assert finish_reasons == ["tool_calls"]
 
 
+def test_stream_chat_completion_error_before_first_token_skips_role_prelude():
+    # The role prelude ships with the first engine event, so a stream that fails
+    # before the first token carries only the error chunk (matches sglang timing).
+    state = FakeState([UserReply(uid=42, incremental_output="", finished=True, error="engine exploded")])
+
+    chunks = run(_collect(stream_chat_completion_chunks(42, chat_request(stream=True), state)))
+    events = parse_sse(chunks)
+
+    assert events[-1] == "[DONE]"
+    assert not any(isinstance(event, dict) and event.get("choices") for event in events)
+    assert any(isinstance(event, dict) and "error" in event for event in events)
+
+
 def test_tool_choice_none_keeps_tool_tags_as_content():
     output = '[TOOL_CALLS] [{"name":"get_weather","arguments":{"city":"Paris"}}]'
     state = FakeState([UserReply(uid=42, incremental_output=output, finished=True)])
