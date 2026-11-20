@@ -1822,6 +1822,37 @@ def test_pin_budget_saturates_and_falls_back_to_sync(tmp_path):
     cm.cache_req(req, finished=False)
     assert cm._host_put_seq == seq_before   # no pin taken: sync fallback
     assert tier.pending_puts == 0           # the sync put already applied
+    assert cm._host_put_bases == {}         # the sync put never enters the seq queue
+
+
+def test_put_inflight_limit_default_and_saturated_boundary(monkeypatch):
+    """The in-flight bound is the first saturated leg (FREETOKEN_PUT_INFLIGHT_LIMIT,
+    default imported from the cost model so the window park reserve always covers its
+    worst case): hitting it flips saturated and the CacheManager eligibility vote
+    falls back to the sync put, capping how many window slots park at once."""
+    from freetoken.kvcache.dsv4_cost_model import DEFAULT_PUT_INFLIGHT_LIMIT
+
+    monkeypatch.delenv("FREETOKEN_PUT_INFLIGHT_LIMIT", raising=False)
+    tier = DSV4PrefixTier(_pool(), page_size=P, capacity_pages=4)
+    assert tier._put_inflight_limit == DEFAULT_PUT_INFLIGHT_LIMIT == 4
+    assert tier.stats_snapshot()["put_inflight_limit"] == DEFAULT_PUT_INFLIGHT_LIMIT
+
+    tier._pending_puts = tier._put_inflight_limit - 1
+    assert not tier.saturated
+    tier._pending_puts = tier._put_inflight_limit
+    assert tier.saturated
+
+
+def test_put_inflight_limit_env_override(monkeypatch):
+    """The env override must be resolved per-construction (it feeds the TP
+    eligibility vote, so both ranks have to run the same value)."""
+    monkeypatch.setenv("FREETOKEN_PUT_INFLIGHT_LIMIT", "2")
+    tier = DSV4PrefixTier(_pool(), page_size=P, capacity_pages=4)
+    assert tier._put_inflight_limit == 2
+    tier._pending_puts = 2
+    assert tier.saturated
+    tier._pending_puts = 1
+    assert not tier.saturated
 
 
 def test_tp_gate_and_unanimity_vote(tmp_path, monkeypatch):
@@ -1906,6 +1937,10 @@ def test_free_swa_defers_pages_mid_gather(tmp_path):
     cm._free_swa(pt[0, :P])
     assert cm._deferred_swa_frees == full.tolist()      # parked, not freed
     assert bool((pool.full_to_window[full.long()] >= 0).all())
+    # Telemetry surface for /v1/stats hicache: the parked count and the unapplied
+    # put-seq width are the regression signal for the per-tick drain.
+    assert cm.parked_swa_slots == len(full)
+    assert cm.put_inflight_seqs == 1
 
     # A page whose base is NOT a gather source frees directly, mid-put or not.
     other = torch.arange(2 * P, 3 * P, dtype=torch.int32)
@@ -1916,11 +1951,15 @@ def test_free_swa_defers_pages_mid_gather(tmp_path):
     assert bool((pool.full_to_window[other.long()] == -1).all())
 
     # The drain applies the release on both ranks (applied=1) and prunes the
-    # base set; the flush then frees exactly the parked slots.
+    # base set; the flush then frees exactly the parked slots. drain_host_puts is
+    # the scheduler's per-tick entry into the same drain.
     cm._host_release_applied = 1
+    cm.drain_host_puts()
     cm._flush_deferred_swa_frees()
     assert cm._deferred_swa_frees == []
     assert bool((pool.full_to_window[full.long()] == -1).all())
+    assert cm.put_inflight_seqs == 0
+    assert cm.parked_swa_slots == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")

@@ -29,6 +29,7 @@ from freetoken.utils import align_down, init_logger
 
 from .gds_io import GdsPageReader, GdsPageWriter, gds_available
 from . import gds_io
+from .dsv4_cost_model import DEFAULT_PUT_INFLIGHT_LIMIT
 from .radix_cache import RadixPrefixCache
 
 logger = init_logger(__name__)
@@ -133,13 +134,17 @@ class DSV4PrefixTier:
     supports_dsv4 = True
     supports_async = True
     # Backpressure bound: above this many queued puts the caller falls back to a
-    # synchronous write-through. Each queued job pins its source GPU pages via the
-    # SWA tree, so the bound also caps how much eviction space a burst can hold back.
-    # Bursts of simultaneous commits (one per running request) must absorb into the
-    # async queue: falling back to a synchronous put stalls the scheduler behind the
-    # writer's DMA. 16 covers max-running-requests waves with margin; the pins held
-    # while queued are bounded by the same number of request paths.
-    ASYNC_PUT_QUEUE_LIMIT = 16
+    # synchronous write-through. The bound also caps the deferred window-slot
+    # parking: every in-flight put parks up to 2 window pages per full page of
+    # its run (13-page run -> ~26 slots) until both TP ranks' writers release
+    # its seq, and the window pool's spare set is small at high max-running-req.
+    # DEFAULT_PUT_INFLIGHT_LIMIT=4 parks at most ~104 slots, matching the park
+    # reserve the cost model adds to the window floor
+    # (dsv4_cost_model.dsv4_put_park_reserve_pages); the old 16 parked up to
+    # ~416 slots and stalled decode's window allocation on decode-heavy shapes.
+    # Override with FREETOKEN_PUT_INFLIGHT_LIMIT; must be identical on all TP
+    # ranks (feeds the async-eligibility vote).
+    DEFAULT_PUT_INFLIGHT_LIMIT = 4
 
     def __init__(self, pool, *, page_size: int, capacity_pages: int,
                  disk_dir: str | Path | None = None,
@@ -192,6 +197,10 @@ class DSV4PrefixTier:
         self._pinned_inflight_bytes = 0
         self._pin_budget = max(
             0, int(os.environ.get("FREETOKEN_PUT_PIN_BUDGET", str(2 * 1024**3))))
+        # Effective inflight bound for `saturated`; imported from the cost model so
+        # the park reserve sized there always covers this bound's worst case.
+        self._put_inflight_limit = max(1, int(os.environ.get(
+            "FREETOKEN_PUT_INFLIGHT_LIMIT", str(DEFAULT_PUT_INFLIGHT_LIMIT))))
         # Bumped by clear(); an in-flight put whose generation no longer matches is
         # dropped instead of resurrecting stale pages into the fresh index.
         self._generation = 0
@@ -288,6 +297,7 @@ class DSV4PrefixTier:
             "disk_pages": len(self.disk_pages),
             "gds_reads": self.stats.gds_reads,
             "pending_puts": self._pending_puts,
+            "put_inflight_limit": self._put_inflight_limit,
             "pinned_inflight_bytes": self._pinned_inflight_bytes,
             "capacity_pages": self.capacity_pages,
             "disk_capacity_pages": self.disk_capacity_pages,
@@ -539,7 +549,7 @@ class DSV4PrefixTier:
 
     @property
     def saturated(self) -> bool:
-        return (self._pending_puts >= self.ASYNC_PUT_QUEUE_LIMIT
+        return (self._pending_puts >= self._put_inflight_limit
                 or self._pinned_inflight_bytes >= self._pin_budget)
 
     @_timed("put")

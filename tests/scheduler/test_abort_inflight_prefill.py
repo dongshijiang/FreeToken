@@ -192,6 +192,26 @@ def test_prefix_commit_sentinel_guard():
     assert [m.uid for m in sent] == [UID]  # un-marked path still publishes the token
 
 
+def test_process_last_data_drains_host_puts_per_tick():
+    """The async-put parking fix: decode-only ticks have no other drain point, so
+    window slots parked by in-flight host puts used to persist a whole decode round
+    and stall decode's window allocation. _process_last_data must call the drain
+    exactly once per tick when a host prefix cache is attached and never when there
+    is none (abort paths keep their own ordering)."""
+    _pool, cm, _tm, _dm, _pm, _sent, stub = _setup()
+    stub._last_data = _as_last_data(Batch(reqs=[], phase="decode"))
+
+    calls = []
+    real_drain = cm.drain_host_puts
+    cm.drain_host_puts = lambda: (calls.append(1), real_drain())[-1]
+    Scheduler._process_last_data(stub, stub._last_data)
+    assert calls == []                 # no host cache attached: the gate stays shut
+
+    cm.host_prefix_cache = object()    # any non-None host cache opens the gate
+    Scheduler._process_last_data(stub, stub._last_data)
+    assert calls == [1]                # exactly one drain per tick
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

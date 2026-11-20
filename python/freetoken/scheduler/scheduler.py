@@ -524,6 +524,14 @@ class Scheduler(SchedulerIOMixin):
                     self.cache_manager.cache_req(req, finished=False, ready=copy_done)
 
         self.finished_reqs = new_finished_reqs
+        # Per-tick drain of deferred host-put releases. The standing drain points
+        # (match_req, put path, restore quiesce) do not run during decode-only
+        # phases, so parked swa slots persisted a whole decode round and stalled
+        # decode's window allocation. This point runs on every rank every tick
+        # (TP-lockstep contract), keeping the drain's MIN pairing symmetric, and
+        # is free of collectives while no put is in flight.
+        if self.cache_manager.host_prefix_cache is not None:
+            self.cache_manager.drain_host_puts()
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
         used, total = self._kv_usage_pages()
@@ -545,6 +553,8 @@ class Scheduler(SchedulerIOMixin):
                 if self.cache_manager.host_prefix_cache is not None:
                     try:
                         m.hicache = self.cache_manager.host_prefix_cache.stats_snapshot()
+                        m.hicache["parked_swa_slots"] = self.cache_manager.parked_swa_slots
+                        m.hicache["put_inflight_seqs"] = self.cache_manager.put_inflight_seqs
                     except Exception as exc:
                         logger.warning("could not snapshot host prefix cache: %r", exc)
                 # Test fakes stub the scheduler as a bare SimpleNamespace; the TPOT stage

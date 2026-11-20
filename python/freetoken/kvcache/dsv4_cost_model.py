@@ -26,6 +26,26 @@ from dataclasses import dataclass, field
 _BF16_BYTES = 2
 _FP32_BYTES = 4
 
+# Async-put inflight bound (FREETOKEN_PUT_INFLIGHT_LIMIT) and the window pages
+# one in-flight put job can park. Single definition: dsv4_prefix_tier imports
+# DEFAULT_PUT_INFLIGHT_LIMIT for its saturated() bound so the two stay in sync.
+DEFAULT_PUT_INFLIGHT_LIMIT = 4
+# Up to 2 window pages parked per full page of one put run (13-page runs seen
+# on the multi-turn shapes).
+PUT_PARK_PAGES_PER_JOB = 26
+
+
+def dsv4_put_park_reserve_pages() -> int:
+    """Window pages that in-flight async host puts may hold via deferred frees.
+
+    Each put parks the window slots of the pages it is gathering until both TP
+    ranks' writers release its seq. Without a reserve the parked set (up to
+    limit x PUT_PARK_PAGES_PER_JOB) eats the window pool's small spare set and
+    stalls decode's per-step window allocation."""
+    limit = max(1, int(os.environ.get("FREETOKEN_PUT_INFLIGHT_LIMIT",
+                                      str(DEFAULT_PUT_INFLIGHT_LIMIT))))
+    return limit * PUT_PARK_PAGES_PER_JOB
+
 
 def dsv4_reserved_window_pages(max_running_req: int, radix: bool) -> int:
     """Window pages the sliding pool must always keep for the concurrent working set: each
@@ -33,9 +53,13 @@ def dsv4_reserved_window_pages(max_running_req: int, radix: bool) -> int:
     request one locked live-tail page AND a retained (soft-pinned) prompt-end window -- the
     window is 2 pages here because the retention gap page-aligns to a whole extra page at
     P==window==128, so a distinct follow-up per running request can re-lock 2 pages each.
+    Plus the deferred-parking reserve: in-flight async host puts hold window slots until
+    both ranks' writers release their seq (dsv4_put_park_reserve_pages); without it the
+    parked set eats the pool's spare pages and decode's window allocation stalls.
     Shared by the engine's window-floor and the manager's prefill_chunk_budget so both
     reserve the same set."""
-    return 2 * (max_running_req + 1) + (3 * max_running_req if radix else 0) + 1
+    return (2 * (max_running_req + 1) + (3 * max_running_req if radix else 0) + 1
+            + dsv4_put_park_reserve_pages())
 
 
 def ring_size_for_ratio(ratio: int) -> int:
@@ -245,7 +269,12 @@ def dsv4_solve_num_pages(
     when even the minimal pool does not fit.
     """
     def _sizes(num: int) -> DSV4PoolSizes:
-        win = max(floor_win_pages, (round(swa_ratio * num * P) + P - 1) // P)
+        # The park reserve rides on whichever window term wins: the floor already
+        # includes it (dsv4_reserved_window_pages), so the ratio term carries it
+        # too when it dominates, else a ratio-bound window would drop the reserve.
+        win = max(floor_win_pages,
+                  (round(swa_ratio * num * P) + P - 1) // P
+                  + dsv4_put_park_reserve_pages())
         return dsv4_pool_sizes(num, args, swa_ratio, P=P, n_win_pages=win)
 
     lo = max(floor_win_pages, 2)  # full history must at least cover the window working set
@@ -355,8 +384,12 @@ def _dsv4_pool_sizes(config, num_pages: int, num_swa_pages: int | None = None):
         # Absolute window: `target` usable pages + 1 dummy, floored and capped at the full anchor.
         win = min(num_pages, max(floor_pages, int(target) + 1))
     else:
-        # Default: ratio x full, rounded UP to whole window pages (floor applied ONCE, in pages).
-        win = max(floor_pages, (round(swa_ratio * num_pages * P) + P - 1) // P)
+        # Default: ratio x full, rounded UP to whole window pages (floor applied ONCE, in
+        # pages). The park reserve rides on whichever term wins: the floor already
+        # includes it, so the ratio term carries it too when it dominates.
+        win = max(floor_pages,
+                  (round(swa_ratio * num_pages * P) + P - 1) // P
+                  + dsv4_put_park_reserve_pages())
     return dsv4_pool_sizes(
         num_pages=num_pages,
         args=config.model_config.dsv4_args,

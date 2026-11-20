@@ -233,6 +233,28 @@ class CacheManager:
             union |= self._host_put_bases.get(seq, ())
         return union
 
+    # Telemetry for /v1/stats hicache: how many window slots are dark only
+    # because their put is in flight, and how many put seqs are unapplied.
+    # parked_swa_slots collapsing to 0 within a tick of put_inflight_seqs
+    # reaching 0 is the regression signal for the per-tick drain.
+
+    @property
+    def parked_swa_slots(self) -> int:
+        return len(self._deferred_swa_frees)
+
+    @property
+    def put_inflight_seqs(self) -> int:
+        return self._host_put_seq - self._host_release_applied
+
+    def drain_host_puts(self) -> None:
+        """Per-tick drain entry for the scheduler's finish path.
+
+        The other drain points (match_req, put path, restore quiesce) do not run
+        during decode-only phases, so parked swa slots used to persist a whole
+        decode round. Free of collectives while no put is in flight (the applied
+        guard inside _drain_host_releases), so calling it every tick is cheap."""
+        self._drain_host_releases()
+
     def _flush_deferred_swa_frees(self) -> None:
         """Release parked swa slots whose gathering puts have completed on both ranks.
 

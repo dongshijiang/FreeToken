@@ -112,6 +112,67 @@ def test_dsv4_kv_cost_and_floor_parity():
         DSV4PagedKVCache.solve_num_pages(_dsv4_config(num_page_override=1), 0)
 
 
+def test_dsv4_put_park_reserve_formula(monkeypatch):
+    """The async-put parking fix: the window pool must carry a reserve sized by the
+    in-flight put bound (FREETOKEN_PUT_INFLIGHT_LIMIT x park pages per job) so the
+    window slots parked by in-flight puts never eat the decode working set."""
+    from freetoken.kvcache.dsv4_cost_model import (
+        DEFAULT_PUT_INFLIGHT_LIMIT,
+        PUT_PARK_PAGES_PER_JOB,
+        dsv4_put_park_reserve_pages,
+        dsv4_reserved_window_pages,
+    )
+
+    monkeypatch.delenv("FREETOKEN_PUT_INFLIGHT_LIMIT", raising=False)
+    assert dsv4_put_park_reserve_pages() == 104
+    assert DEFAULT_PUT_INFLIGHT_LIMIT * PUT_PARK_PAGES_PER_JOB == 104
+    # mrr=2: 2 decode transients per req + dummy, + radix 3 per req (tail + retention)
+    assert dsv4_reserved_window_pages(2, True) == 2 * 3 + 3 * 2 + 1 + 104
+    assert dsv4_reserved_window_pages(2, False) == 2 * 3 + 1 + 104
+
+    monkeypatch.setenv("FREETOKEN_PUT_INFLIGHT_LIMIT", "2")
+    assert dsv4_put_park_reserve_pages() == 2 * PUT_PARK_PAGES_PER_JOB
+    assert dsv4_reserved_window_pages(2, True) == 13 + 2 * PUT_PARK_PAGES_PER_JOB
+
+
+def test_dsv4_pool_sizes_carry_park_reserve_on_both_terms(monkeypatch):
+    """The reserve must ride on whichever window-sizing term wins: the floor already
+    includes it, so the ratio term carries it too when IT dominates -- else a
+    ratio-bound window would silently drop the reserve. The explicit override path
+    is never inflated (the pin is the user's choice)."""
+    from freetoken.kvcache.dsv4_cost_model import (
+        PUT_PARK_PAGES_PER_JOB,
+        _dsv4_pool_sizes,
+        _dsv4_window_floor_pages,
+        dsv4_put_park_reserve_pages,
+    )
+
+    monkeypatch.delenv("FREETOKEN_PUT_INFLIGHT_LIMIT", raising=False)
+    park = dsv4_put_park_reserve_pages()
+    cfg = _dsv4_config()
+    cfg.swa_full_tokens_ratio = 0.1
+    floor = _dsv4_window_floor_pages(cfg, cfg.page_size)
+
+    # Ratio-dominated anchor (ratio term 2048 >> floor): ratio + park, not raw ratio.
+    big = _dsv4_pool_sizes(cfg, 4096)
+    assert big.n_win_pages == 410 + park
+
+    # Floor-dominated anchor (ratio term 20 + park < floor, and num_pages > floor so
+    # the win<=num_pages cap does not clamp): the floor wins and the reserve is
+    # counted exactly ONCE (the floor already contains it).
+    small = _dsv4_pool_sizes(cfg, 200)
+    assert small.n_win_pages == floor
+
+    # The reserve tracks the env override through the sizing path too.
+    monkeypatch.setenv("FREETOKEN_PUT_INFLIGHT_LIMIT", "2")
+    assert _dsv4_pool_sizes(cfg, 4096).n_win_pages == 410 + 2 * PUT_PARK_PAGES_PER_JOB
+
+    # Explicit window override: raised to the floor when below it, never inflated past it.
+    object.__setattr__(cfg, "swa_num_pages_override", 8)
+    monkeypatch.delenv("FREETOKEN_PUT_INFLIGHT_LIMIT", raising=False)
+    assert _dsv4_pool_sizes(cfg, 4096).n_win_pages == floor
+
+
 def test_startup_kv_budget_composition():
     # The engine-side budget must stay ratio*old - (old - new); a sign/order slip here
     # mis-sizes every model's startup KV pool with the whole CPU suite green.
